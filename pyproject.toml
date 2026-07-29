@@ -1,0 +1,24 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "contractflow-research"
+version = "0.1.0"
+description = "Research core for contract-guided personalized long-form textbook generation."
+readme = "README.md"
+requires-python = ">=3.10"
+authors = [{ name = "Anonymous Authors" }]
+dependencies = [
+    "json-repair>=0.35,<1",
+]
+
+[project.scripts]
+contractflow = "learnbyai_research.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["learnbyai_research*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

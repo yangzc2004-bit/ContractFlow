@@ -1,0 +1,12 @@
+{
+  "benchmark": {
+    "dataset": "",
+    "indices": []
+  },
+  "task_family_adapters": {},
+  "generation": {
+    "direct": {},
+    "agentwrite": {},
+    "harness_full": {}
+  }
+}
