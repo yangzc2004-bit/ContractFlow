@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import argparse
 import json
-import os
 import sys
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
@@ -38,7 +37,13 @@ def main() -> None:
     parser.add_argument(
         "--systems",
         nargs="+",
-        choices=["direct", "contractflow"],
+        choices=[
+            "direct",
+            "contractflow",
+            "no_contract",
+            "no_review_repair",
+            "neither",
+        ],
         required=True,
     )
     parser.add_argument("--per-type", type=positive_int, required=True)
@@ -100,6 +105,8 @@ def generate_one(
                 / system
                 / f"{task_id(task)}.json"
             ),
+            use_contracts=system not in {"no_contract", "neither"},
+            use_review_repair=system not in {"no_review_repair", "neither"},
         )
     write_json(output_path, output)
 

@@ -536,7 +536,7 @@ def run_legacy_longbench_write_harness(
     final_text = "\n\n".join(section["text"] for section in sections)
     return generation_record(
         task,
-        "harness_full",
+        "contractflow",
         final_text,
         started,
         histories,
@@ -813,7 +813,7 @@ def run_morelongwrite_harness(
     final_text = "\n\n".join(section["text"] for section in final_sections)
     return generation_record(
         task,
-        "harness_full",
+        "contractflow",
         final_text,
         started,
         histories,

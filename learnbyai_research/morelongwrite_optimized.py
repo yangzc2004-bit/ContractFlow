@@ -196,7 +196,7 @@ def run_morelongwrite_optimized(
     final_text = _assemble_document(task, final_sections)
     return generation_record(
         task,
-        "harness_full",
+        "contractflow",
         final_text,
         started,
         histories,

@@ -1,5 +1,6 @@
 {
   "benchmark": {
+    "name": "MoreLongWrite",
     "dataset": "",
     "indices": []
   },
@@ -7,6 +8,6 @@
   "generation": {
     "direct": {},
     "agentwrite": {},
-    "harness_full": {}
+    "contractflow": {}
   }
 }

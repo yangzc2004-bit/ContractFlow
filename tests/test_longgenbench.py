@@ -11,6 +11,7 @@ from learnbyai_research.longgenbench import (
     parse_contract_plan,
     parse_document_blocks,
     parse_minimum_words,
+    run_harness,
     select_balanced_indices,
     structural_issues,
     task_from_dataset_item,
@@ -182,6 +183,71 @@ def test_harness_checkpoint_rejects_another_pipeline_version(tmp_path) -> None:
         assert "incompatible pipeline version" in str(error)
     else:
         raise AssertionError("expected an incompatible checkpoint to be rejected")
+
+
+class AblationLLM:
+    model = "ablation-test"
+
+    def __init__(self) -> None:
+        self.prompts: list[str] = []
+
+    def complete(self, prompt: str, **kwargs) -> str:
+        self.prompts.append(prompt)
+        if "LONGGEN_REVIEW_SEGMENTS_JSON" in prompt:
+            return '{"results":[]}'
+        if "LONGGEN_WRITE_SEGMENTS" in prompt or "LONGGEN_REPAIR_SEGMENTS" in prompt:
+            return (
+                "<<<SEGMENT 1>>>\n"
+                + "word " * 20
+                + "\n<<<END SEGMENT 1>>>\n"
+                + "<<<SEGMENT 2>>>\n"
+                + "word " * 20
+                + "\n<<<END SEGMENT 2>>>"
+            )
+        return "{}"
+
+    def completion_history(self) -> list[dict]:
+        return []
+
+
+def test_no_contract_ablation_skips_contract_compilation_and_review() -> None:
+    task = task_from_dataset_item(0, dataset_item("Week"))
+    llm = AblationLLM()
+    output = run_harness(
+        task,
+        llm,
+        batch_size=2,
+        plan_max_output_tokens=1,
+        generation_max_output_tokens=1,
+        review_max_output_tokens=1,
+        repair_max_output_tokens=1,
+        use_llm_plan=False,
+        use_contracts=False,
+        use_review_repair=True,
+    )
+    assert output["system"] == "no_contract"
+    assert output["metadata"]["compiled_contract_overrides"] == []
+    assert not any("LONGGEN_REVIEW_SEGMENTS_JSON" in prompt for prompt in llm.prompts)
+
+
+def test_no_review_repair_ablation_stops_after_generation() -> None:
+    task = task_from_dataset_item(0, dataset_item("Week"))
+    llm = AblationLLM()
+    output = run_harness(
+        task,
+        llm,
+        batch_size=2,
+        plan_max_output_tokens=1,
+        generation_max_output_tokens=1,
+        review_max_output_tokens=1,
+        repair_max_output_tokens=1,
+        use_llm_plan=False,
+        use_contracts=True,
+        use_review_repair=False,
+    )
+    assert output["system"] == "no_review_repair"
+    assert output["metadata"]["review_results"] == []
+    assert output["metadata"]["repair_records"] == []
 
 
 def test_compile_week_contracts_maps_dates_ranges_and_periodicity() -> None:

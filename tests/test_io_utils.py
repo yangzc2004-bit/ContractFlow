@@ -1,4 +1,6 @@
-from learnbyai_research.io_utils import export_chapter_markdown_files, extract_json_object
+from dataclasses import dataclass
+
+from learnbyai_research.io_utils import extract_json_object, read_json, write_json
 
 
 def test_extract_json_object_repairs_trailing_commas() -> None:
@@ -6,41 +8,28 @@ def test_extract_json_object_repairs_trailing_commas() -> None:
         """
         ```json
         {
-          "course_bible": {
-            "target_learner": "beginner",
+          "plan": {
+            "summary": "example",
           },
-          "chapters": [
-            {"title": "Intro"},
+          "segments": [
+            {"index": 1},
           ],
         }
         ```
         """
     )
 
-    assert payload["course_bible"]["target_learner"] == "beginner"
-    assert payload["chapters"][0]["title"] == "Intro"
+    assert payload["plan"]["summary"] == "example"
+    assert payload["segments"][0]["index"] == 1
 
 
-def test_export_chapter_markdown_files_writes_content_only(tmp_path) -> None:
-    output = {
-        "pipeline": "single_agent",
-        "metadata": {"ignored": True},
-        "chapters": [
-            {
-                "plan": {"title": "第一章：探索/利用"},
-                "content_markdown": "# 第一章\n\n正文",
-                "review": {"ignored": True},
-            },
-            {
-                "plan": {"title": "Second Chapter"},
-                "content_markdown": "  # Second\n\nBody  ",
-                "contract": {"ignored": True},
-            },
-        ],
-    }
+@dataclass
+class ExampleRecord:
+    index: int
+    labels: tuple[str, ...]
 
-    written = export_chapter_markdown_files(output, tmp_path)
 
-    assert [path.name for path in written] == ["01_第一章_探索_利用.md", "02_Second_Chapter.md"]
-    assert written[0].read_text(encoding="utf-8") == "# 第一章\n\n正文\n"
-    assert written[1].read_text(encoding="utf-8") == "# Second\n\nBody\n"
+def test_write_json_serializes_dataclasses(tmp_path) -> None:
+    path = tmp_path / "record.json"
+    write_json(path, ExampleRecord(index=1, labels=("a", "b")))
+    assert read_json(path) == {"index": 1, "labels": ["a", "b"]}

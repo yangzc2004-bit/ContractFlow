@@ -29,14 +29,14 @@ from learnbyai_research.morelongwrite_optimized import run_morelongwrite_optimiz
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Run a configured LongBench-Write transfer study.")
+    parser = argparse.ArgumentParser(description="Run a configured MoreLongWrite transfer study.")
     parser.add_argument("--config", required=True)
     parser.add_argument("--run-dir", required=True)
     parser.add_argument("--indices", nargs="+", type=int)
     parser.add_argument(
         "--systems",
         nargs="+",
-        choices=["direct", "harness_full", "agentwrite"],
+        choices=["direct", "contractflow", "agentwrite"],
         required=True,
     )
     parser.add_argument("--preflight", action="store_true")
@@ -143,7 +143,7 @@ def generate_one(system, task, config: dict[str, Any], run_dir: Path) -> dict[st
             **generation["agentwrite"],
         )
     adapter_name = config["task_family_adapters"][task.task_type]
-    harness_generation = dict(generation["harness_full"])
+    harness_generation = dict(generation["contractflow"])
     profile = str(harness_generation.get("profile", "legacy_longbench_write"))
     all_roles_use_author_model = bool(
         harness_generation.pop("all_roles_use_author_model", False)

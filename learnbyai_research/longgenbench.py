@@ -344,6 +344,35 @@ USER_PROMPT:
 """
 
 
+def build_segmented_generation_prompt(
+    task: LongGenTask,
+    indices: list[int],
+    prior_context: str,
+) -> str:
+    return f"""LONGGEN_WRITE_SEGMENTS
+
+Write the requested long-form document segments directly from USER_PROMPT.
+
+Requirements:
+- Return exactly these segment indices: {indices}.
+- Each segment must contain at least {task.minimum_words} English words.
+- Follow all requirements in USER_PROMPT.
+- Maintain continuity with PRIOR_CONTEXT.
+- Return final reader-facing prose, not an outline or analysis.
+- Do not use JSON. Use the exact tags below for every segment:
+
+<<<SEGMENT 1>>>
+complete segment prose
+<<<END SEGMENT 1>>>
+
+PRIOR_CONTEXT:
+{prior_context or "(start of document)"}
+
+USER_PROMPT:
+{task.prompt}
+"""
+
+
 def parse_generated_segments(
     expected: list[SegmentContract],
     payload: dict[str, Any] | str,
@@ -472,6 +501,39 @@ FAILING_SEGMENTS:
 """
 
 
+def build_structural_repair_prompt(
+    task: LongGenTask,
+    contracts: list[SegmentContract],
+    segments: dict[int, str],
+    issues: dict[int, dict[str, Any]],
+) -> str:
+    items = [
+        {
+            "index": contract.index,
+            "minimum_words": task.minimum_words,
+            "current_text": segments.get(contract.index, ""),
+            "issues": issues.get(contract.index, {}).get("issues", []),
+        }
+        for contract in contracts
+    ]
+    return f"""LONGGEN_REPAIR_SEGMENTS
+
+Replace each missing or structurally incomplete segment with complete reader-facing
+prose. Follow USER_PROMPT, preserve correct content, and meet the minimum word count.
+Return the complete replacement segment using the exact tags below:
+
+<<<SEGMENT 1>>>
+complete repaired segment prose
+<<<END SEGMENT 1>>>
+
+USER_PROMPT:
+{task.prompt}
+
+FAILING_SEGMENTS:
+{json.dumps(items, ensure_ascii=False)}
+"""
+
+
 def build_direct_prompt(task: LongGenTask) -> str:
     return task.prompt
 
@@ -583,6 +645,8 @@ def run_harness(
     repair_max_output_tokens: int,
     checkpoint_path: str | Path | None = None,
     use_llm_plan: bool = True,
+    use_contracts: bool = True,
+    use_review_repair: bool = True,
 ) -> dict[str, Any]:
     started = time.perf_counter()
     checkpoint = _load_harness_checkpoint(checkpoint_path, task)
@@ -629,7 +693,7 @@ def run_harness(
             dict(item) for item in checkpoint.get("repair_records", []) if isinstance(item, dict)
         ]
     else:
-        if use_llm_plan:
+        if use_contracts and use_llm_plan:
             plan_payload = complete_json(
                 llm,
                 build_plan_prompt(task),
@@ -646,7 +710,7 @@ def run_harness(
                 max_output_tokens=plan_max_output_tokens,
             )
             applied_corrections = apply_plan_corrections(contracts, audit_payload)
-        else:
+        elif use_contracts:
             document_summary = _compiled_document_summary(task)
             contracts = [
                 SegmentContract(
@@ -661,7 +725,29 @@ def run_harness(
                 "segments": [{"index": contract.index} for contract in contracts],
             }
             applied_corrections = []
-        compiled_overrides = apply_compiled_contracts(contracts, compile_prompt_contracts(task))
+        else:
+            document_summary = (
+                f"Generate {task.segment_count} ordered {task.segment_type} segments "
+                "from the public task prompt."
+            )
+            contracts = [
+                SegmentContract(
+                    index=index,
+                    purpose=f"Write segment {index} of the requested document.",
+                )
+                for index in range(1, task.segment_count + 1)
+            ]
+            plan_payload = {
+                "source": "segmented_generation_without_contracts",
+                "document_summary": document_summary,
+                "segments": [{"index": contract.index} for contract in contracts],
+            }
+            applied_corrections = []
+        compiled_overrides = (
+            apply_compiled_contracts(contracts, compile_prompt_contracts(task))
+            if use_contracts
+            else []
+        )
         segments = {}
         generation_batches = []
         review_records = []
@@ -686,8 +772,22 @@ def run_harness(
     for batch in chunked(contracts, batch_size):
         if all(contract.index in segments for contract in batch):
             continue
+        generation_prompt = (
+            build_generation_prompt(
+                task,
+                document_summary,
+                batch,
+                _prior_context(segments),
+            )
+            if use_contracts
+            else build_segmented_generation_prompt(
+                task,
+                [contract.index for contract in batch],
+                _prior_context(segments),
+            )
+        )
         raw = llm.complete(
-            build_generation_prompt(task, document_summary, batch, _prior_context(segments)),
+            generation_prompt,
             system="You write final long-form segments using the required segment tags.",
             temperature=0.25,
             max_output_tokens=generation_max_output_tokens,
@@ -718,11 +818,11 @@ def run_harness(
 
     hard_issues = structural_issues(task, contracts, segments)
     issues.update(hard_issues)
-    review_targets = [
-        contract
-        for contract in contracts
-        if contract.required_events
-    ]
+    review_targets = (
+        [contract for contract in contracts if contract.required_events]
+        if use_review_repair
+        else []
+    )
     reviewed_indices = {
         int(record["index"])
         for record in review_records
@@ -775,7 +875,11 @@ def run_harness(
             stage=f"reviewed_{len(reviewed_indices)}",
         )
 
-    failing_contracts = [contract for contract in contracts if contract.index in issues]
+    failing_contracts = (
+        [contract for contract in contracts if contract.index in issues]
+        if use_review_repair
+        else []
+    )
     repaired_indices = {
         int(record["index"])
         for record in repair_records
@@ -785,8 +889,13 @@ def run_harness(
         batch = [contract for contract in batch if contract.index not in repaired_indices]
         if not batch:
             continue
+        repair_prompt = (
+            build_repair_prompt(task, batch, segments, issues)
+            if use_contracts
+            else build_structural_repair_prompt(task, batch, segments, issues)
+        )
         raw = llm.complete(
-            build_repair_prompt(task, batch, segments, issues),
+            repair_prompt,
             system="You repair complete long-form segments using the required segment tags.",
             temperature=0.15,
             max_output_tokens=repair_max_output_tokens,
@@ -823,7 +932,7 @@ def run_harness(
     final_text = assemble_document(task, segments)
     return {
         "task": task_record(task),
-        "system": "harness_full",
+        "system": harness_system_name(use_contracts, use_review_repair),
         "final_text": final_text,
         "segments": [{"index": index, "text": text} for index, text in sorted(segments.items())],
         "contracts": [
@@ -850,9 +959,21 @@ def run_harness(
             "final_structural_issues": final_structural_issues,
             "completion_history": completion_history(llm),
             "resumed_from_checkpoint": checkpoint is not None,
-            "use_llm_plan": use_llm_plan,
+            "use_llm_plan": use_llm_plan and use_contracts,
+            "use_contracts": use_contracts,
+            "use_review_repair": use_review_repair,
         },
     }
+
+
+def harness_system_name(use_contracts: bool, use_review_repair: bool) -> str:
+    if use_contracts and use_review_repair:
+        return "contractflow"
+    if not use_contracts and use_review_repair:
+        return "no_contract"
+    if use_contracts and not use_review_repair:
+        return "no_review_repair"
+    return "neither"
 
 
 def complete_json(
