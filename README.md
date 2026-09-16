@@ -158,6 +158,23 @@ python -m pytest
 python scripts/validate_release.py
 ```
 
+### License
+
+ContractFlow is licensed under the [PolyForm Noncommercial License 1.0.0](LICENSE).
+It is made available for **non-commercial academic research, education,
+evaluation, reproducibility studies, and other non-commercial purposes** in
+accordance with that license.
+
+**Commercial use is not permitted without separate prior written authorization
+from the copyright holders.** This includes incorporating ContractFlow or
+substantial portions of its source code into a commercial product or paid
+service, commercial deployment, sublicensing, sale, or other commercial
+exploitation.
+
+If you use ContractFlow in academic work, please cite the corresponding paper
+and this repository. For commercial licensing or collaboration, please contact
+the copyright holders.
+
 ---
 
 ## 中文
@@ -301,3 +318,15 @@ LongGen 评测工具保留索引片段解析，以及 Once、Range、Periodic、
 python -m pytest
 python scripts/validate_release.py
 ```
+
+### 许可声明
+
+ContractFlow 采用 [PolyForm Noncommercial License 1.0.0](LICENSE)。按照该许可证，
+本项目可用于**非商业的学术研究、教育、评测、复现实验及其他非商业用途**。
+
+**未经版权持有人另行事先书面授权，不得将 ContractFlow 用于商业用途。**
+商业用途包括但不限于：将 ContractFlow 或其实质性代码纳入商业产品或收费服务、
+进行商业部署、转授权、出售，或以其他方式进行商业利用。
+
+如在学术工作中使用 ContractFlow，请引用对应论文及本仓库。商业授权或合作事宜
+请联系版权持有人。
