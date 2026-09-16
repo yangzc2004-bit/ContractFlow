@@ -160,7 +160,7 @@ python scripts/validate_release.py
 
 ### License
 
-ContractFlow is licensed under the [PolyForm Noncommercial License 1.0.0](LICENSE).
+ContractFlow is licensed under the [PolyForm Noncommercial License 1.0.0](LICENSE.md).
 It is made available for **non-commercial academic research, education,
 evaluation, reproducibility studies, and other non-commercial purposes** in
 accordance with that license.
@@ -321,7 +321,7 @@ python scripts/validate_release.py
 
 ### 许可声明
 
-ContractFlow 采用 [PolyForm Noncommercial License 1.0.0](LICENSE)。按照该许可证，
+ContractFlow 采用 [PolyForm Noncommercial License 1.0.0](LICENSE.md)。按照该许可证，
 本项目可用于**非商业的学术研究、教育、评测、复现实验及其他非商业用途**。
 
 **未经版权持有人另行事先书面授权，不得将 ContractFlow 用于商业用途。**
