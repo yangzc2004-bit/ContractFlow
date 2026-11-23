@@ -299,3 +299,101 @@ def test_failed_evaluation_counts_technical_failure_as_zero() -> None:
     assert row["completion_rate"] == 0.0
     assert row["average_accuracy"] == 0.0
     assert row["checks"][0]["present"] is False
+
+
+def test_select_balanced_indices_supports_32k_types() -> None:
+    dataset = [
+        dataset_item("Day", number=365),
+        dataset_item("Floor", number=300),
+        dataset_item("Menu Day", number=365),
+        dataset_item("Block", number=361),
+        dataset_item("Day", number=365),
+        dataset_item("Floor", number=300),
+        dataset_item("Menu Day", number=365),
+        dataset_item("Block", number=361),
+    ]
+    assert select_balanced_indices(dataset, per_type=2) == list(range(8))
+
+
+def test_run_longgenbench_selection_and_cli_options() -> None:
+    import importlib.util
+    from pathlib import Path
+
+    script_path = Path(__file__).resolve().parents[1] / "scripts" / "run_longgenbench.py"
+    spec = importlib.util.spec_from_file_location("run_longgenbench", script_path)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+
+    dataset = [
+        dataset_item("Day", number=365),
+        dataset_item("Floor", number=300),
+        dataset_item("Menu Day", number=365),
+        dataset_item("Block", number=361),
+    ]
+    assert module.select_indices(dataset, run_all=True, per_type=None, indices=None) == [0, 1, 2, 3]
+    assert module.select_indices(dataset, run_all=False, per_type=1, indices=None) == [0, 1, 2, 3]
+    assert module.select_indices(dataset, run_all=False, per_type=None, indices=[3, 1]) == [3, 1]
+
+    args = module.build_parser().parse_args(
+        [
+            "--dataset",
+            "dummy.json",
+            "--run-dir",
+            "runs/test",
+            "--systems",
+            "direct",
+            "contractflow_optimized",
+            "--all",
+            "--no-llm-plan",
+            "--continue-on-error",
+        ]
+    )
+    assert args.all is True
+    assert args.no_llm_plan is True
+    assert args.continue_on_error is True
+    assert args.systems == ["direct", "contractflow_optimized"]
+
+
+def test_eval_longgenbench_handles_failed_generation_and_summary(tmp_path) -> None:
+    import importlib.util
+    import json
+    from pathlib import Path
+
+    script_path = Path(__file__).resolve().parents[1] / "scripts" / "eval_longgenbench.py"
+    spec = importlib.util.spec_from_file_location("eval_longgenbench", script_path)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+
+    dataset = [dataset_item("Day", number=365)]
+    dataset[0]["checks_once"] = {"1": "special event"}
+    err_path = tmp_path / "errors" / "direct" / "0000_day.json"
+    err_path.parent.mkdir(parents=True, exist_ok=True)
+    err_path.write_text(
+        json.dumps({"error_type": "TimeoutError", "error_message": "timed out"}),
+        encoding="utf-8",
+    )
+    args = module.build_parser().parse_args(
+        [
+            "--dataset",
+            "dummy.json",
+            "--run-dir",
+            str(tmp_path),
+            "--systems",
+            "direct",
+            "--all",
+        ]
+    )
+    status, row = module.evaluate_one(args, dataset, "direct", 0)
+    assert status == "failed_generation"
+    assert row is not None and row["status"] == "failed_technical"
+
+    status_cached, row_cached = module.evaluate_one(args, dataset, "direct", 0)
+    assert status_cached == "cached"
+    assert row_cached == row
+
+    summary = summarize_evaluations([row])
+    table = module.format_summary_table(summary)
+    assert "direct" in table
+

@@ -43,9 +43,19 @@ def compact_task_brief(task: LongGenTask) -> str:
             f"{first_sentence} Write a coherent weekly diary with weather, work, family, "
             "and ordinary life updates."
         )
+    if task.segment_type == "Day":
+        return (
+            f"{first_sentence} Write a coherent daily diary with weather, work, family, "
+            "and ordinary daily life updates."
+        )
     if task.segment_type == "Menu Week":
         return (
             f"{first_sentence} Write a varied weekly restaurant menu with concrete dishes "
+            "and concise descriptions."
+        )
+    if task.segment_type == "Menu Day":
+        return (
+            f"{first_sentence} Write a varied daily restaurant menu with concrete dishes "
             "and concise descriptions."
         )
     if task.segment_type == "Floor":
@@ -329,7 +339,7 @@ def run_harness_optimized(
         )
 
     hard_issues = structural_issues(task, contracts, segments)
-    issues = dict(hard_issues)
+    issues.update(hard_issues)
     review_targets = [
         contract
         for contract in contracts
@@ -381,7 +391,15 @@ def run_harness_optimized(
         )
 
     failing_contracts = [contract for contract in contracts if contract.index in issues]
+    repaired_indices = {
+        int(record["index"])
+        for record in repair_records
+        if "index" in record
+    }
     for batch in chunked(failing_contracts, max(1, batch_size // 2)):
+        batch = [contract for contract in batch if contract.index not in repaired_indices]
+        if not batch:
+            continue
         before_words = {
             contract.index: word_count(segments.get(contract.index, ""))
             for contract in batch

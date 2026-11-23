@@ -15,6 +15,7 @@ from .llm import ChatModel, completion_history
 
 
 LONGGEN_TYPES = ("Week", "Floor", "Menu Week", "Block")
+LONGGEN_32K_TYPES = ("Day", "Floor", "Menu Day", "Block")
 HARNESS_PIPELINE_VERSION = "contractflow_longgenbench_v0"
 
 
@@ -44,9 +45,28 @@ def load_dataset(path: str | Path) -> list[dict[str, Any]]:
     return [dict(item) for item in value if isinstance(item, dict)]
 
 
-def select_balanced_indices(dataset: list[dict[str, Any]], per_type: int) -> list[int]:
+def infer_segment_types(dataset: list[dict[str, Any]]) -> tuple[str, ...]:
+    present = {str(item.get("type", "")) for item in dataset}
+    has_32k_only = bool(present & {"Day", "Menu Day"})
+    has_16k_only = bool(present & {"Week", "Menu Week"})
+    if has_32k_only and not has_16k_only:
+        return LONGGEN_32K_TYPES
+    return LONGGEN_TYPES
+
+
+def select_balanced_indices(
+    dataset: list[dict[str, Any]],
+    per_type: int,
+    *,
+    segment_types: Iterable[str] | None = None,
+) -> list[int]:
+    target_types = (
+        tuple(segment_types)
+        if segment_types is not None
+        else infer_segment_types(dataset)
+    )
     selected: list[int] = []
-    counts = {name: 0 for name in LONGGEN_TYPES}
+    counts = {name: 0 for name in target_types}
     for index, item in enumerate(dataset):
         segment_type = str(item.get("type", ""))
         if segment_type not in counts or counts[segment_type] >= per_type:
