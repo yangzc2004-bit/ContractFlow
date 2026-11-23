@@ -3,6 +3,9 @@ from __future__ import annotations
 import re
 from typing import Any
 
+from .llm import ChatModel, completion_history
+from .longgenbench import task_from_dataset_item, task_id
+
 
 OFFICIAL_EXAMPLES = [
     "Example 1: Context: The district's new residential area will feature two "
@@ -30,6 +33,10 @@ OFFICIAL_EXAMPLES = [
 
 def official_output_blocks(final_text: str) -> list[str]:
     return final_text.split("#*#")
+
+
+def official_word_count(final_text: str) -> int:
+    return len(final_text.split())
 
 
 def parse_blocks(output_blocks: list[str], segment_type: str) -> dict[int, str]:
@@ -65,14 +72,122 @@ def completion_rate(type_to_block: dict[int, str], total_number: int) -> float:
     return (len(expected) - len(missing)) / len(expected) * 100 if expected else 0.0
 
 
-def summarize_official(
+def build_official_export_item(
+    dataset_item: dict[str, Any],
+    output: dict[str, Any] | None,
+) -> dict[str, Any]:
+    final_text = str(output.get("final_text", "")) if isinstance(output, dict) else ""
+    return {
+        "input": dataset_item["prompt"],
+        "checks_once": dataset_item.get("checks_once", {}),
+        "checks_range": dataset_item.get("checks_range", {}),
+        "checks_periodic": dataset_item.get("checks_periodic", {}),
+        "type": dataset_item["type"],
+        "number": dataset_item["number"],
+        "output_blocks": official_output_blocks(final_text),
+        "word_count": official_word_count(final_text),
+    }
+
+
+def evaluate_official_output(
+    dataset_item: dict[str, Any],
+    output: dict[str, Any],
+    llm: ChatModel,
+    *,
+    temperature: float = 0.0,
+    max_output_tokens: int = 50,
+) -> dict[str, Any]:
+    dataset_index = int(output["task"]["dataset_index"])
+    task = task_from_dataset_item(dataset_index, dataset_item)
+    final_text = str(output.get("final_text", ""))
+    blocks = official_output_blocks(final_text)
+    type_to_block = parse_blocks(blocks, task.segment_type)
+    cr = completion_rate(type_to_block, task.segment_count)
+
+    results_by_category: dict[str, dict[str, str]] = {}
+    total_checks_by_category: dict[str, int] = {}
+    for category in ("once", "range", "periodic"):
+        raw_checks = dataset_item.get(f"checks_{category}", {})
+        if not isinstance(raw_checks, dict):
+            raw_checks = {}
+        total_checks_by_category[category] = len(raw_checks)
+        category_results: dict[str, str] = {}
+        for raw_index, event_description in raw_checks.items():
+            identifier = int(raw_index)
+            if identifier not in type_to_block:
+                continue
+            response = llm.complete(
+                create_prompt(type_to_block[identifier], str(event_description)),
+                system=None,
+                temperature=temperature,
+                max_output_tokens=max_output_tokens,
+            )
+            category_results[str(identifier)] = classify_response(response)
+        results_by_category[category] = category_results
+
+    return {
+        "task_id": output["task"].get("task_id") or task_id(task),
+        "dataset_index": dataset_index,
+        "type": task.segment_type,
+        "number": task.segment_count,
+        "system": output["system"],
+        "model": output.get("metadata", {}).get("model"),
+        "completion_rate": cr,
+        "word_count": official_word_count(final_text),
+        "output_block_count": len(blocks),
+        "results_once": results_by_category["once"],
+        "results_range": results_by_category["range"],
+        "results_periodic": results_by_category["periodic"],
+        "total_checks_once": total_checks_by_category["once"],
+        "total_checks_range": total_checks_by_category["range"],
+        "total_checks_periodic": total_checks_by_category["periodic"],
+        "judge_completion_history": completion_history(llm),
+        "status": "complete",
+    }
+
+
+def failed_official_output(
+    dataset_index: int,
+    dataset_item: dict[str, Any],
+    system: str,
+    error: dict[str, Any],
+) -> dict[str, Any]:
+    task = task_from_dataset_item(dataset_index, dataset_item)
+    return {
+        "task_id": task_id(task),
+        "dataset_index": dataset_index,
+        "type": task.segment_type,
+        "number": task.segment_count,
+        "system": system,
+        "model": error.get("completion_history", [{}])[-1].get("model")
+        if error.get("completion_history")
+        else None,
+        "completion_rate": 0.0,
+        "word_count": 0,
+        "output_block_count": 0,
+        "results_once": {},
+        "results_range": {},
+        "results_periodic": {},
+        "total_checks_once": len(dataset_item.get("checks_once", {}) or {}),
+        "total_checks_range": len(dataset_item.get("checks_range", {}) or {}),
+        "total_checks_periodic": len(dataset_item.get("checks_periodic", {}) or {}),
+        "judge_completion_history": [],
+        "status": "failed_technical",
+        "generation_error_type": error.get("error_type"),
+        "generation_error_message": error.get("error_message"),
+    }
+
+
+def _summarize_official_flat(
     records: list[dict[str, Any]],
     *,
     model_name: str,
 ) -> dict[str, Any]:
     categories = ("once", "range", "periodic")
     accuracies: dict[str, float] = {}
+    strict_accuracies: dict[str, float] = {}
     check_counts: dict[str, int] = {}
+    total_check_counts: dict[str, int] = {}
     yes_counts: dict[str, int] = {}
     for category in categories:
         values = [
@@ -84,9 +199,37 @@ def summarize_official(
         yes_counts[category] = sum(value == "yes" for value in values)
         accuracies[category] = yes_counts[category] / len(values) if values else 0.0
 
+        total_checks = sum(
+            int(
+                record.get(
+                    f"total_checks_{category}",
+                    len(record.get(f"results_{category}", {})),
+                )
+            )
+            for record in records
+        )
+        total_check_counts[category] = total_checks
+        strict_accuracies[category] = (
+            yes_counts[category] / total_checks if total_checks else 0.0
+        )
+
     average_accuracy = sum(accuracies.values()) / len(categories)
+    strict_average_accuracy = sum(strict_accuracies.values()) / len(categories)
+    total_evaluated = sum(check_counts.values())
+    total_yes = sum(yes_counts.values())
+    total_all_checks = sum(total_check_counts.values())
+
+    qualified_words = [
+        int(record.get("word_count", 0))
+        for record in records
+        if int(record.get("output_block_count", 0)) > 40
+        and int(record.get("word_count", 0)) > 2000
+    ]
+    all_words = [int(record.get("word_count", 0)) for record in records]
+
     return {
         "Model": model_name,
+        "task_count": len(records),
         "Completion Rate": (
             sum(float(record["completion_rate"]) for record in records) / len(records)
             if records
@@ -96,6 +239,38 @@ def summarize_official(
         "Accuracy Range": accuracies["range"],
         "Accuracy Periodic": accuracies["periodic"],
         "Average Accuracy": average_accuracy,
+        "Strict Accuracy Once": strict_accuracies["once"],
+        "Strict Accuracy Range": strict_accuracies["range"],
+        "Strict Accuracy Periodic": strict_accuracies["periodic"],
+        "Strict Average Accuracy": strict_average_accuracy,
+        "Ratio Results/Checks": (
+            total_evaluated / total_all_checks if total_all_checks else 0.0
+        ),
+        "Ratio Yes/Results": total_yes / total_evaluated if total_evaluated else 0.0,
+        "Ratio Yes/Checks": total_yes / total_all_checks if total_all_checks else 0.0,
+        "Average Word Count": (
+            sum(qualified_words) / len(qualified_words) if qualified_words else None
+        ),
+        "Mean Word Count": sum(all_words) / len(all_words) if all_words else 0.0,
         "check_counts": check_counts,
+        "total_check_counts": total_check_counts,
         "yes_counts": yes_counts,
     }
+
+
+def summarize_official(
+    records: list[dict[str, Any]],
+    *,
+    model_name: str,
+) -> dict[str, Any]:
+    summary = _summarize_official_flat(records, model_name=model_name)
+    types = sorted({str(record["type"]) for record in records if record.get("type")})
+    if types:
+        summary["by_type"] = {
+            segment_type: _summarize_official_flat(
+                [record for record in records if record.get("type") == segment_type],
+                model_name=model_name,
+            )
+            for segment_type in types
+        }
+    return summary

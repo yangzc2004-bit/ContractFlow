@@ -360,6 +360,8 @@ def test_eval_longgenbench_handles_failed_generation_and_summary(tmp_path) -> No
     import json
     from pathlib import Path
 
+    from learnbyai_research.longgenbench_official_eval import summarize_official
+
     script_path = Path(__file__).resolve().parents[1] / "scripts" / "eval_longgenbench.py"
     spec = importlib.util.spec_from_file_location("eval_longgenbench", script_path)
     assert spec is not None and spec.loader is not None
@@ -385,15 +387,94 @@ def test_eval_longgenbench_handles_failed_generation_and_summary(tmp_path) -> No
             "--all",
         ]
     )
+    assert args.mode == "official"
     status, row = module.evaluate_one(args, dataset, "direct", 0)
     assert status == "failed_generation"
     assert row is not None and row["status"] == "failed_technical"
+    assert row["total_checks_once"] == 1
 
     status_cached, row_cached = module.evaluate_one(args, dataset, "direct", 0)
     assert status_cached == "cached"
     assert row_cached == row
 
-    summary = summarize_evaluations([row])
-    table = module.format_summary_table(summary)
+    summary = {"mode": "official", "systems": {"direct": summarize_official([row], model_name="direct")}}
+    table = module.format_official_summary_table(summary)
     assert "direct" in table
+    assert "Strict Metrics" in table
+
+
+def test_official_eval_matches_upstream_semantics_and_export(tmp_path) -> None:
+    import importlib.util
+    import json
+    from pathlib import Path
+
+    from learnbyai_research.longgenbench_official_eval import (
+        evaluate_official_output,
+        summarize_official,
+    )
+
+    class JudgeStub:
+        model = "judge-stub"
+
+        def __init__(self) -> None:
+            self.prompts: list[str] = []
+
+        def complete(self, prompt: str, **kwargs) -> str:
+            self.prompts.append(prompt)
+            return "yes" if "solar observatory" in prompt else "no"
+
+        def completion_history(self) -> list[dict]:
+            return []
+
+    item = dataset_item("Floor", number=4)
+    item["checks_once"] = {"1": "solar observatory", "4": "rooftop garden"}
+    item["checks_range"] = {"2": "shopping mall"}
+    item["checks_periodic"] = {"2": "rest area"}
+
+    # Only Floor 1 and Floor 2 are generated; Floor 3 and Floor 4 are missing.
+    output = {
+        "task": {"dataset_index": 0, "task_id": "0000_floor"},
+        "system": "direct",
+        "final_text": "#*# Floor 1:\nFeatures a solar observatory.\n#*# Floor 2:\nEmpty lobby.",
+        "metadata": {"model": "qwen-3.5-9b"},
+    }
+    judge = JudgeStub()
+    record = evaluate_official_output(item, output, judge)
+
+    # Missing Floor 4 must NOT be sent to the judge (exact official eval.py behavior).
+    assert len(judge.prompts) == 3
+    assert record["completion_rate"] == 50.0
+    assert record["results_once"] == {"1": "yes"}
+    assert record["total_checks_once"] == 2
+    assert record["results_range"] == {"2": "no"}
+    assert record["results_periodic"] == {"2": "no"}
+
+    summary = summarize_official([record], model_name="direct")
+    # Official eval.py conditional accuracy on present blocks: once=1/1=1.0, range=0/1, periodic=0/1
+    assert summary["Completion Rate"] == 50.0
+    assert summary["Accuracy Once"] == 1.0
+    assert summary["Accuracy Range"] == 0.0
+    assert summary["Accuracy Periodic"] == 0.0
+    assert abs(summary["Average Accuracy"] - (1.0 / 3.0)) < 1e-9
+    # Official static.ipynb strict accuracy over all checks: once=1/2=0.5, total yes/checks = 1/4 = 0.25
+    assert summary["Strict Accuracy Once"] == 0.5
+    assert summary["Ratio Yes/Checks"] == 0.25
+
+    script_path = Path(__file__).resolve().parents[1] / "scripts" / "eval_longgenbench.py"
+    spec = importlib.util.spec_from_file_location("eval_longgenbench_export", script_path)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+
+    gen_path = tmp_path / "generations" / "direct" / "0000_floor.json"
+    gen_path.parent.mkdir(parents=True, exist_ok=True)
+    gen_path.write_text(json.dumps(output), encoding="utf-8")
+    exported = module.export_official_files(tmp_path, [item], [0], ["direct"])
+    exported_items = json.loads(exported["direct"].read_text(encoding="utf-8"))
+    assert len(exported_items) == 1
+    assert exported_items[0]["type"] == "Floor"
+    assert exported_items[0]["number"] == 4
+    assert len(exported_items[0]["output_blocks"]) == 3
+    assert exported_items[0]["word_count"] > 0
+
 
