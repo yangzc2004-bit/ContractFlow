@@ -31,6 +31,8 @@ from learnbyai_research.longgenbench_v2 import run_longgen_v2
 def test_expand_contract_rules_supports_all_four_scopes_and_bounded_stride() -> None:
     rules = [
         ContractRule(scope="all", obligation="Do not invent citations."),
+        ContractRule(scope="range", start=1, end=12, obligation="Keep tone consistent."),
+        ContractRule(scope="every", start=1, step=1, obligation="End with a brief transition."),
         ContractRule(scope="single", index=1, obligation="Introduce core notation."),
         ContractRule(scope="range", start=4, end=6, obligation="Cover consensus algorithms."),
         ContractRule(scope="every", start=3, step=3, obligation="Include a hands-on lab."),
@@ -38,7 +40,11 @@ def test_expand_contract_rules_supports_all_four_scopes_and_bounded_stride() -> 
         ContractRule(scope="single", index=999, obligation="Out of bounds ignored."),
     ]
     invariants, obligations = expand_contract_rules(12, rules)
-    assert invariants == ["Do not invent citations."]
+    assert invariants == [
+        "Do not invent citations.",
+        "Keep tone consistent.",
+        "End with a brief transition.",
+    ]
     assert obligations[1] == ["Introduce core notation."]
     assert obligations[2] == ["Bounded stride note."]
     assert obligations[3] == ["Include a hands-on lab."]

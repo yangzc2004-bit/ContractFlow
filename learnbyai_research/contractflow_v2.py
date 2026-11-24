@@ -159,8 +159,13 @@ def expand_contract_rules(
             stop = min(total_units, rule.end) if rule.end is not None else total_units
             if rule.start <= stop:
                 targets = range(rule.start, stop + 1, rule.step)
-        for index in targets:
-            if 1 <= index <= total_units and text not in obligations[index]:
+        valid_targets = [index for index in targets if 1 <= index <= total_units]
+        if total_units > 1 and len(set(valid_targets)) == total_units:
+            if text not in global_invariants:
+                global_invariants.append(text)
+            continue
+        for index in valid_targets:
+            if text not in obligations[index]:
                 obligations[index].append(text)
     return global_invariants, obligations
 
@@ -225,7 +230,9 @@ Rules for accuracy:
 - Put general style/consistency/domain rules into "global_invariants" (or scope "all"), NOT into localized rules.
 - All unit indices are 1-based (1 through total_units).
 - Read starting baselines, numbering order, and inclusive bounds carefully.
+- For "every" rules, leave "end" as null whenever USER_REQUEST does not state an explicit stopping bound; do NOT guess or invent a cutoff.
 - If a requirement involves converting a date, coordinate, or grid/schedule position into a 1-based index, write a brief step-by-step arithmetic check in "derivation" BEFORE choosing the integers.
+- Double-check that every integer field ("index", "start", "end", "step") matches the exact numbers in your "derivation" and "obligation".
 - If a rule spans positions separated by a constant stride (e.g., jumping by a fixed offset along a schedule or 2D grid), use scope "every" with exact "start", "end", and "step".
 - Keep each "obligation" concrete, faithful to USER_REQUEST, and free of invented details.
 - Leave "unit_titles" empty ({{}}) unless specific chapter/section titles are requested or helpful for open-ended writing.
