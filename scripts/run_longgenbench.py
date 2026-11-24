@@ -93,8 +93,14 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--workers", type=positive_int, default=4)
     parser.add_argument("--batch-size", type=positive_int, default=8)
     parser.add_argument("--plan-max-output-tokens", type=positive_int, default=4096)
+    parser.add_argument(
+        "--plan-chunk-size",
+        type=positive_int,
+        default=60,
+        help="Max segments planned/audited per LLM call in contractflow (default: 60).",
+    )
     parser.add_argument("--generation-max-output-tokens", type=positive_int, default=4096)
-    parser.add_argument("--review-max-output-tokens", type=positive_int, default=2048)
+    parser.add_argument("--review-max-output-tokens", type=positive_int, default=4096)
     parser.add_argument("--repair-max-output-tokens", type=positive_int, default=4096)
     parser.add_argument("--direct-max-output-tokens", type=positive_int, default=16384)
     parser.add_argument(
@@ -208,6 +214,7 @@ def generate_one(
                 use_llm_plan=not getattr(args, "no_llm_plan", False),
                 use_contracts=system not in {"no_contract", "neither"},
                 use_review_repair=system not in {"no_review_repair", "neither"},
+                plan_chunk_size=getattr(args, "plan_chunk_size", 60),
             )
     except Exception as error:
         if not getattr(args, "continue_on_error", False):

@@ -19,6 +19,7 @@ from .longgenbench import (
     assemble_document,
     chunked,
     compile_prompt_contracts,
+    complete_json,
     parse_generated_segments,
     parse_review_results,
     structural_issues,
@@ -286,7 +287,7 @@ def run_harness_optimized(
             max_output_tokens=generation_max_output_tokens,
         )
         completion = llm.completion_metadata()
-        parsed = parse_generated_segments(batch, raw)
+        parsed = parse_generated_segments(batch, raw, segment_type=task.segment_type)
         accepted: dict[int, str] = {}
         short_indices: list[int] = []
         for contract in batch:
@@ -354,13 +355,13 @@ def run_harness_optimized(
         outstanding = [contract for contract in batch if contract.index not in reviewed_indices]
         if not outstanding:
             continue
-        payload = _complete_json(
+        batch_results = _review_optimized_batch(
+            task,
             llm,
-            build_optimized_review_prompt(task, outstanding, segments),
-            system="Review explicit segment contracts. Return valid JSON only.",
-            max_output_tokens=review_max_output_tokens,
+            outstanding,
+            segments,
+            review_max_output_tokens=review_max_output_tokens,
         )
-        batch_results = parse_review_results(payload)
         for contract in outstanding:
             record = batch_results.get(contract.index)
             if record is None:
@@ -411,7 +412,7 @@ def run_harness_optimized(
             max_output_tokens=repair_max_output_tokens,
         )
         completion = llm.completion_metadata()
-        repaired = parse_generated_segments(batch, raw)
+        repaired = parse_generated_segments(batch, raw, segment_type=task.segment_type)
         for contract in batch:
             text = repaired.get(contract.index, "").strip()
             accepted = bool(text) and word_count(text) >= task.minimum_words
@@ -476,6 +477,50 @@ def run_harness_optimized(
     }
 
 
+def _review_optimized_batch(
+    task: LongGenTask,
+    llm: ChatModel,
+    batch: list[SegmentContract],
+    segments: dict[int, str],
+    *,
+    review_max_output_tokens: int,
+) -> dict[int, dict[str, Any]]:
+    try:
+        payload = _complete_json(
+            llm,
+            build_optimized_review_prompt(task, batch, segments),
+            system="Review explicit segment contracts. Return valid JSON only.",
+            max_output_tokens=review_max_output_tokens,
+        )
+        return parse_review_results(payload)
+    except ValueError:
+        if len(batch) > 1:
+            mid = len(batch) // 2
+            left = _review_optimized_batch(
+                task,
+                llm,
+                batch[:mid],
+                segments,
+                review_max_output_tokens=review_max_output_tokens,
+            )
+            right = _review_optimized_batch(
+                task,
+                llm,
+                batch[mid:],
+                segments,
+                review_max_output_tokens=review_max_output_tokens,
+            )
+            return {**left, **right}
+        contract = batch[0]
+        return {
+            contract.index: {
+                "passed": False,
+                "missing_events": list(contract.required_events),
+                "issues": ["review json parsing failed"],
+            }
+        }
+
+
 def _complete_json(
     llm: ChatModel,
     prompt: str,
@@ -483,20 +528,13 @@ def _complete_json(
     system: str,
     max_output_tokens: int,
 ) -> dict[str, Any]:
-    raw = llm.complete(
+    return complete_json(
+        llm,
         prompt,
         system=system,
         temperature=0.0,
-        response_format="json_object",
         max_output_tokens=max_output_tokens,
     )
-    try:
-        payload = json.loads(raw)
-    except json.JSONDecodeError as error:
-        raise ValueError(f"optimized review returned invalid JSON: {error}") from error
-    if not isinstance(payload, dict):
-        raise ValueError("optimized review JSON must be an object")
-    return payload
 
 
 def _write_optimized_checkpoint(

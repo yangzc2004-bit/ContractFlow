@@ -199,6 +199,56 @@ USER_PROMPT:
 """
 
 
+def build_plan_chunk_prompt(
+    task: LongGenTask,
+    indices: list[int],
+    *,
+    document_summary: str = "",
+) -> str:
+    first_index = indices[0]
+    last_index = indices[-1]
+    is_contiguous = indices == list(range(first_index, last_index + 1))
+    scope_desc = (
+        f"indices {first_index} through {last_index} ({len(indices)} records)"
+        if is_contiguous
+        else f"exact indices {indices} ({len(indices)} records)"
+    )
+    summary_section = (
+        f"\nEXISTING_DOCUMENT_SUMMARY:\n{document_summary}\n"
+        if document_summary
+        else ""
+    )
+    return f"""LONGGEN_CONTRACT_PLAN_CHUNK_JSON
+
+Create compact segment-by-segment execution contracts ONLY for {scope_desc}
+out of {task.segment_count} total {task.segment_type} segments.
+
+Requirements:
+- Return ONLY the requested segment indices: {indices}.
+- Keep purpose and continuity brief (under 15 words each).
+- Read dates, ranges, intervals, and periodic rules carefully.
+- Expand every single-instance, range, and periodic requirement affecting these indices into required_events.
+- Do not invent additional special events and do not repeat duplicate events in the same list.
+- Do not use information outside USER_PROMPT.
+
+Return valid JSON only:
+{{
+  "document_summary": "short global continuity plan",
+  "segments": [
+    {{
+      "index": {first_index},
+      "purpose": "brief ordinary plan",
+      "required_events": ["exact required event if any"],
+      "continuity": "brief link"
+    }}
+  ]
+}}
+{summary_section}
+USER_PROMPT:
+{task.prompt}
+"""
+
+
 def build_plan_audit_prompt(task: LongGenTask, plan: dict[str, Any]) -> str:
     compact_plan = {
         "document_summary": plan.get("document_summary", ""),
@@ -236,7 +286,12 @@ CURRENT_CONTRACTS:
 """
 
 
-def parse_contract_plan(task: LongGenTask, payload: dict[str, Any]) -> tuple[str, list[SegmentContract]]:
+def _collect_contract_segments(
+    task: LongGenTask,
+    payload: dict[str, Any],
+    *,
+    allowed_indices: set[int] | None = None,
+) -> dict[int, SegmentContract]:
     raw_segments = payload.get("segments", [])
     if not isinstance(raw_segments, list):
         raise ValueError("contract plan segments must be a list")
@@ -250,12 +305,19 @@ def parse_contract_plan(task: LongGenTask, payload: dict[str, Any]) -> tuple[str
             continue
         if not 1 <= index <= task.segment_count or index in by_index:
             continue
+        if allowed_indices is not None and index not in allowed_indices:
+            continue
         by_index[index] = SegmentContract(
             index=index,
             purpose=str(raw.get("purpose", "")),
             required_events=_string_list(raw.get("required_events")),
             continuity=str(raw.get("continuity", "")),
         )
+    return by_index
+
+
+def parse_contract_plan(task: LongGenTask, payload: dict[str, Any]) -> tuple[str, list[SegmentContract]]:
+    by_index = _collect_contract_segments(task, payload)
     missing = [index for index in range(1, task.segment_count + 1) if index not in by_index]
     if missing:
         raise ValueError(f"contract plan is missing segment indices: {missing[:10]}")
@@ -682,6 +744,7 @@ def run_harness(
     use_llm_plan: bool = True,
     use_contracts: bool = True,
     use_review_repair: bool = True,
+    plan_chunk_size: int = 60,
 ) -> dict[str, Any]:
     started = time.perf_counter()
     checkpoint = _load_harness_checkpoint(checkpoint_path, task)
@@ -729,22 +792,17 @@ def run_harness(
         ]
     else:
         if use_contracts and use_llm_plan:
-            plan_payload = complete_json(
+            (
+                plan_payload,
+                document_summary,
+                contracts,
+                applied_corrections,
+            ) = _plan_and_audit_with_llm(
+                task,
                 llm,
-                build_plan_prompt(task),
-                system="You are a long-form contract planner. Return valid JSON only.",
-                temperature=0.1,
-                max_output_tokens=plan_max_output_tokens,
+                plan_max_output_tokens=plan_max_output_tokens,
+                plan_chunk_size=plan_chunk_size,
             )
-            document_summary, contracts = parse_contract_plan(task, plan_payload)
-            audit_payload = complete_json(
-                llm,
-                build_plan_audit_prompt(task, plan_payload),
-                system="You audit long-form execution contracts. Return valid JSON only.",
-                temperature=0.0,
-                max_output_tokens=plan_max_output_tokens,
-            )
-            applied_corrections = apply_plan_corrections(contracts, audit_payload)
         elif use_contracts:
             document_summary = _compiled_document_summary(task)
             contracts = [
@@ -866,21 +924,21 @@ def run_harness(
         if "index" in record
     }
     for batch in chunked(review_targets, batch_size):
-        if all(contract.index in reviewed_indices for contract in batch):
+        outstanding = [contract for contract in batch if contract.index not in reviewed_indices]
+        if not outstanding:
             continue
-        payload = complete_json(
+        batch_results = _review_segment_batch(
+            task,
             llm,
-            build_review_prompt(task, batch, segments),
-            system="You review long-form segments against explicit contracts. Return valid JSON only.",
-            temperature=0.0,
-            max_output_tokens=review_max_output_tokens,
+            outstanding,
+            segments,
+            review_max_output_tokens=review_max_output_tokens,
         )
-        batch_results = parse_review_results(payload)
         review_records.extend(
             {"index": index, **record}
             for index, record in sorted(batch_results.items())
         )
-        for contract in batch:
+        for contract in outstanding:
             record = batch_results.get(contract.index)
             if record is None:
                 issues.setdefault(
@@ -1015,6 +1073,257 @@ def harness_system_name(use_contracts: bool, use_review_repair: bool) -> str:
     return "neither"
 
 
+def _was_truncated(llm: ChatModel) -> bool:
+    getter = getattr(llm, "completion_metadata", None)
+    if not callable(getter):
+        return False
+    metadata = getter()
+    return isinstance(metadata, dict) and metadata.get("finish_reason") == "length"
+
+
+def _scaled_retry_tokens(current: int) -> int:
+    if current < 64:
+        return current
+    return min(65_536, max(current * 2, current + 2_048))
+
+
+def _plan_and_audit_with_llm(
+    task: LongGenTask,
+    llm: ChatModel,
+    *,
+    plan_max_output_tokens: int,
+    plan_chunk_size: int = 60,
+) -> tuple[dict[str, Any], str, list[SegmentContract], list[dict[str, Any]]]:
+    chunk_limit = max(1, plan_chunk_size)
+    by_index: dict[int, SegmentContract] = {}
+    document_summary = ""
+    all_indices = list(range(1, task.segment_count + 1))
+
+    if task.segment_count <= chunk_limit:
+        try:
+            initial_payload = complete_json(
+                llm,
+                build_plan_prompt(task),
+                system="You are a long-form contract planner. Return valid JSON only.",
+                temperature=0.1,
+                max_output_tokens=plan_max_output_tokens,
+            )
+            document_summary = str(initial_payload.get("document_summary", "")).strip()
+            by_index.update(_collect_contract_segments(task, initial_payload))
+        except ValueError:
+            # Fall back to half-sized chunks if even a single-shot plan failed or truncated.
+            half_limit = max(1, task.segment_count // 2)
+            pending_chunks = list(chunked(all_indices, half_limit))
+            document_summary = _fill_plan_chunks(
+                task,
+                llm,
+                pending_chunks,
+                by_index,
+                document_summary=document_summary,
+                plan_max_output_tokens=plan_max_output_tokens,
+            )
+    else:
+        pending_chunks = list(chunked(all_indices, chunk_limit))
+        document_summary = _fill_plan_chunks(
+            task,
+            llm,
+            pending_chunks,
+            by_index,
+            document_summary=document_summary,
+            plan_max_output_tokens=plan_max_output_tokens,
+        )
+
+    missing = [index for index in all_indices if index not in by_index]
+    if missing:
+        document_summary = _fill_plan_chunks(
+            task,
+            llm,
+            list(chunked(missing, chunk_limit)),
+            by_index,
+            document_summary=document_summary,
+            plan_max_output_tokens=plan_max_output_tokens,
+        )
+
+    backfilled_indices: list[int] = []
+    for index in all_indices:
+        if index not in by_index:
+            by_index[index] = SegmentContract(
+                index=index,
+                purpose=f"Write a distinct, coherent {task.segment_type.lower()} entry.",
+            )
+            backfilled_indices.append(index)
+
+    if not document_summary:
+        document_summary = _compiled_document_summary(task)
+
+    contracts = [by_index[index] for index in all_indices]
+    plan_payload: dict[str, Any] = {
+        "document_summary": document_summary,
+        "segments": [
+            {
+                "index": contract.index,
+                "purpose": contract.purpose,
+                "required_events": list(contract.required_events),
+                "continuity": contract.continuity,
+            }
+            for contract in contracts
+        ],
+    }
+    if task.segment_count > chunk_limit:
+        plan_payload["plan_chunk_size"] = chunk_limit
+    if backfilled_indices:
+        plan_payload["backfilled_indices"] = backfilled_indices
+
+    applied_corrections: list[dict[str, Any]] = []
+    for audit_chunk in chunked(contracts, chunk_limit):
+        applied_corrections.extend(
+            _audit_plan_chunk(
+                task,
+                llm,
+                document_summary,
+                audit_chunk,
+                plan_max_output_tokens=plan_max_output_tokens,
+            )
+        )
+    return plan_payload, document_summary, contracts, applied_corrections
+
+
+def _fill_plan_chunks(
+    task: LongGenTask,
+    llm: ChatModel,
+    initial_chunks: list[list[int]],
+    by_index: dict[int, SegmentContract],
+    *,
+    document_summary: str,
+    plan_max_output_tokens: int,
+) -> str:
+    queue = [list(chunk) for chunk in initial_chunks if chunk]
+    while queue:
+        indices = queue.pop(0)
+        outstanding = [index for index in indices if index not in by_index]
+        if not outstanding:
+            continue
+        try:
+            payload = complete_json(
+                llm,
+                build_plan_chunk_prompt(
+                    task,
+                    outstanding,
+                    document_summary=document_summary,
+                ),
+                system="You are a long-form contract planner. Return valid JSON only.",
+                temperature=0.1,
+                max_output_tokens=plan_max_output_tokens,
+            )
+            if not document_summary:
+                document_summary = str(payload.get("document_summary", "")).strip()
+            collected = _collect_contract_segments(
+                task,
+                payload,
+                allowed_indices=set(outstanding),
+            )
+            by_index.update(collected)
+        except ValueError:
+            if len(outstanding) > 1:
+                mid = max(1, len(outstanding) // 2)
+                queue.insert(0, outstanding[mid:])
+                queue.insert(0, outstanding[:mid])
+    return document_summary
+
+
+def _audit_plan_chunk(
+    task: LongGenTask,
+    llm: ChatModel,
+    document_summary: str,
+    chunk: list[SegmentContract],
+    *,
+    plan_max_output_tokens: int,
+) -> list[dict[str, Any]]:
+    chunk_plan = {
+        "document_summary": document_summary,
+        "segments": [
+            {
+                "index": contract.index,
+                "required_events": list(contract.required_events),
+            }
+            for contract in chunk
+        ],
+    }
+    try:
+        audit_payload = complete_json(
+            llm,
+            build_plan_audit_prompt(task, chunk_plan),
+            system="You audit long-form execution contracts. Return valid JSON only.",
+            temperature=0.0,
+            max_output_tokens=plan_max_output_tokens,
+        )
+        return apply_plan_corrections(chunk, audit_payload)
+    except ValueError:
+        if len(chunk) > 4:
+            mid = len(chunk) // 2
+            left = _audit_plan_chunk(
+                task,
+                llm,
+                document_summary,
+                chunk[:mid],
+                plan_max_output_tokens=plan_max_output_tokens,
+            )
+            right = _audit_plan_chunk(
+                task,
+                llm,
+                document_summary,
+                chunk[mid:],
+                plan_max_output_tokens=plan_max_output_tokens,
+            )
+            return left + right
+        return []
+
+
+def _review_segment_batch(
+    task: LongGenTask,
+    llm: ChatModel,
+    batch: list[SegmentContract],
+    segments: dict[int, str],
+    *,
+    review_max_output_tokens: int,
+) -> dict[int, dict[str, Any]]:
+    try:
+        payload = complete_json(
+            llm,
+            build_review_prompt(task, batch, segments),
+            system="You review long-form segments against explicit contracts. Return valid JSON only.",
+            temperature=0.0,
+            max_output_tokens=review_max_output_tokens,
+        )
+        return parse_review_results(payload)
+    except ValueError:
+        if len(batch) > 1:
+            mid = len(batch) // 2
+            left = _review_segment_batch(
+                task,
+                llm,
+                batch[:mid],
+                segments,
+                review_max_output_tokens=review_max_output_tokens,
+            )
+            right = _review_segment_batch(
+                task,
+                llm,
+                batch[mid:],
+                segments,
+                review_max_output_tokens=review_max_output_tokens,
+            )
+            return {**left, **right}
+        contract = batch[0]
+        return {
+            contract.index: {
+                "passed": False,
+                "missing_events": list(contract.required_events),
+                "issues": ["review json parsing failed"],
+            }
+        }
+
+
 def complete_json(
     llm: ChatModel,
     prompt: str,
@@ -1026,10 +1335,20 @@ def complete_json(
 ) -> dict[str, Any]:
     raw = ""
     error: Exception | None = None
+    truncated = False
+    attempt_tokens = max_output_tokens
     for attempt in range(max_schema_retries + 1):
         request_prompt = prompt
         if attempt:
-            request_prompt = f"""LONGGEN_JSON_SCHEMA_CORRECTION
+            if truncated:
+                attempt_tokens = _scaled_retry_tokens(attempt_tokens)
+                request_prompt = (
+                    "Previous response was truncated at the token limit. "
+                    "Return compact, valid JSON only without repeating items or verbose prose.\n\n"
+                    + prompt
+                )
+            else:
+                request_prompt = f"""LONGGEN_JSON_SCHEMA_CORRECTION
 
 Repair the malformed response below into valid JSON without changing its substantive
 content, omitting records, or adding commentary. Escape quotation marks inside strings.
@@ -1046,8 +1365,9 @@ PARSER_ERROR:
             system=system,
             temperature=0.0 if attempt else temperature,
             response_format="json_object",
-            max_output_tokens=max_output_tokens,
+            max_output_tokens=attempt_tokens,
         )
+        truncated = _was_truncated(llm)
         try:
             return extract_json_object(raw)
         except ValueError as caught:

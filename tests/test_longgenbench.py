@@ -527,3 +527,178 @@ def test_official_eval_matches_upstream_semantics_and_export(tmp_path) -> None:
     assert exported_items[0]["word_count"] > 0
 
 
+def test_complete_json_scales_budget_without_echoing_truncated_response() -> None:
+    from learnbyai_research.longgenbench import complete_json
+
+    class TruncatingLLM:
+        model = "truncating-fixture"
+
+        def __init__(self) -> None:
+            self.calls: list[tuple[str, int | None]] = []
+            self._meta: dict = {}
+
+        def complete(self, prompt: str, **kwargs) -> str:
+            max_tokens = kwargs.get("max_output_tokens")
+            self.calls.append((prompt, max_tokens))
+            if len(self.calls) == 1:
+                self._meta = {"finish_reason": "length"}
+                return '{"segments": [{"index": 1'
+            self._meta = {"finish_reason": "stop"}
+            return '{"ok": true}'
+
+        def completion_metadata(self) -> dict:
+            return dict(self._meta)
+
+        def completion_history(self) -> list[dict]:
+            return []
+
+    llm = TruncatingLLM()
+    payload = complete_json(
+        llm,
+        "BASE_PROMPT",
+        system="sys",
+        temperature=0.1,
+        max_output_tokens=2048,
+    )
+    assert payload == {"ok": True}
+    assert len(llm.calls) == 2
+    assert llm.calls[1][1] == 4096
+    assert "MALFORMED_RESPONSE" not in llm.calls[1][0]
+    assert "BASE_PROMPT" in llm.calls[1][0]
+
+
+def test_run_harness_chunks_large_llm_plans_and_backfills_missing_indices() -> None:
+    import json
+    import re
+
+    class ChunkedPlanLLM:
+        model = "chunked-plan-fixture"
+
+        def __init__(self) -> None:
+            self.plan_calls = 0
+            self.audit_calls = 0
+            self._meta: dict = {"finish_reason": "stop"}
+
+        def complete(self, prompt: str, **kwargs) -> str:
+            if "LONGGEN_CONTRACT_PLAN_CHUNK_JSON" in prompt:
+                self.plan_calls += 1
+                match = re.search(r"Return ONLY the requested segment indices: (\[[^\]]+\])", prompt)
+                indices = json.loads(match.group(1)) if match else []
+                # Deliberately omit the last index on the very first chunk to test backfill.
+                returned = indices[:-1] if self.plan_calls == 1 and len(indices) > 1 else indices
+                self._meta = {"finish_reason": "stop"}
+                return json.dumps(
+                    {
+                        "document_summary": "chunked summary",
+                        "segments": [
+                            {"index": idx, "purpose": f"plan {idx}", "required_events": [], "continuity": ""}
+                            for idx in returned
+                        ],
+                    }
+                )
+            if "LONGGEN_CONTRACT_AUDIT_JSON" in prompt:
+                self.audit_calls += 1
+                self._meta = {"finish_reason": "stop"}
+                return '{"corrections": []}'
+            if "LONGGEN_WRITE_SEGMENTS" in prompt:
+                indices = [int(x) for x in re.findall(r'"index":\s*(\d+)', prompt)]
+                return "\n".join(
+                    f"<<<SEGMENT {idx}>>>\n" + "word " * 20 + f"\n<<<END SEGMENT {idx}>>>"
+                    for idx in indices
+                )
+            return '{"results": []}'
+
+        def completion_metadata(self) -> dict:
+            return dict(self._meta)
+
+        def completion_history(self) -> list[dict]:
+            return []
+
+    task = task_from_dataset_item(0, dataset_item("Floor", number=10))
+    llm = ChunkedPlanLLM()
+    output = run_harness(
+        task,
+        llm,
+        batch_size=5,
+        plan_max_output_tokens=2048,
+        generation_max_output_tokens=2048,
+        review_max_output_tokens=2048,
+        repair_max_output_tokens=2048,
+        use_llm_plan=True,
+        plan_chunk_size=4,
+    )
+    # 10 segments with chunk_size=4 -> 3 initial chunks + 1 backfill chunk = 4 plan calls
+    assert llm.plan_calls == 4
+    assert llm.audit_calls == 3
+    assert [c["index"] for c in output["contracts"]] == list(range(1, 11))
+    assert [s["index"] for s in output["segments"]] == list(range(1, 11))
+
+
+def test_run_harness_splits_truncated_review_batch_instead_of_crashing() -> None:
+    import json
+    import re
+
+    class SplittingReviewLLM:
+        model = "split-review-fixture"
+
+        def __init__(self) -> None:
+            self.review_batch_sizes: list[int] = []
+            self._meta: dict = {"finish_reason": "stop"}
+
+        def complete(self, prompt: str, **kwargs) -> str:
+            if "LONGGEN_REVIEW_SEGMENTS_JSON" in prompt:
+                segments_json = prompt.split("SEGMENTS_TO_REVIEW:\n", 1)[1].strip()
+                items = json.loads(segments_json)
+                indices = [int(entry["index"]) for entry in items]
+                self.review_batch_sizes.append(len(indices))
+                if len(indices) > 1:
+                    self._meta = {"finish_reason": "length"}
+                    return '{"results": [{"index": 1'
+                self._meta = {"finish_reason": "stop"}
+                return json.dumps(
+                    {
+                        "results": [
+                            {"index": indices[0], "passed": True, "missing_events": [], "issues": []}
+                        ]
+                    }
+                )
+            if "LONGGEN_WRITE_SEGMENTS" in prompt:
+                contracts_json = prompt.split("SEGMENT_CONTRACTS:\n", 1)[1].split("\n\nUSER_PROMPT:", 1)[0].strip()
+                indices = [int(entry["index"]) for entry in json.loads(contracts_json)]
+                return "\n".join(
+                    f"<<<SEGMENT {idx}>>>\n" + "word " * 22 + f"\n<<<END SEGMENT {idx}>>>"
+                    for idx in indices
+                )
+            return "{}"
+
+        def completion_metadata(self) -> dict:
+            return dict(self._meta)
+
+        def completion_history(self) -> list[dict]:
+            return []
+
+    item = dataset_item("Week", number=2)
+    item["prompt"] = (
+        "Diary:\n"
+        "2) Attending a festival in week 1-2.\n"
+        "Each entry should be at least 20 words."
+    )
+    task = task_from_dataset_item(0, item)
+    llm = SplittingReviewLLM()
+    output = run_harness(
+        task,
+        llm,
+        batch_size=2,
+        plan_max_output_tokens=2048,
+        generation_max_output_tokens=2048,
+        review_max_output_tokens=2048,
+        repair_max_output_tokens=2048,
+        use_llm_plan=False,
+    )
+    assert len(output["segments"]) == 2
+    assert 2 in llm.review_batch_sizes
+    assert llm.review_batch_sizes.count(1) == 2
+    assert output["metadata"]["repair_records"] == []
+
+
+
