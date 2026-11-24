@@ -15,6 +15,7 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
+from learnbyai_research.contractflow_v2 import FlowConfig
 from learnbyai_research.llm import OpenAICompatibleClient
 from learnbyai_research.longgenbench import (
     load_dataset,
@@ -26,6 +27,15 @@ from learnbyai_research.longgenbench import (
     task_record,
 )
 from learnbyai_research.longgenbench_optimized import run_harness_optimized
+from learnbyai_research.longgenbench_v2 import run_longgen_v2
+
+
+V2_SYSTEMS = {
+    "v2_contractflow",
+    "v2_no_contract",
+    "v2_no_review_repair",
+    "v2_neither",
+}
 
 
 def positive_int(value: str) -> int:
@@ -79,6 +89,10 @@ def build_parser() -> argparse.ArgumentParser:
             "no_contract",
             "no_review_repair",
             "neither",
+            "v2_contractflow",
+            "v2_no_contract",
+            "v2_no_review_repair",
+            "v2_neither",
         ],
         required=True,
     )
@@ -92,27 +106,27 @@ def build_parser() -> argparse.ArgumentParser:
     selection.add_argument("--indices", nargs="+", type=int)
     parser.add_argument("--workers", type=positive_int, default=4)
     parser.add_argument("--batch-size", type=positive_int, default=8)
-    parser.add_argument("--plan-max-output-tokens", type=positive_int, default=4096)
+    parser.add_argument("--plan-max-output-tokens", type=positive_int, default=2048)
     parser.add_argument(
         "--plan-chunk-size",
         type=positive_int,
         default=60,
-        help="Max segments planned/audited per LLM call in contractflow (default: 60).",
+        help="Max segments planned/audited per LLM call in v1 contractflow (default: 60).",
     )
-    parser.add_argument("--generation-max-output-tokens", type=positive_int, default=4096)
+    parser.add_argument("--generation-max-output-tokens", type=positive_int, default=6144)
     parser.add_argument("--review-max-output-tokens", type=positive_int, default=4096)
     parser.add_argument("--repair-max-output-tokens", type=positive_int, default=4096)
     parser.add_argument("--direct-max-output-tokens", type=positive_int, default=16384)
     parser.add_argument(
         "--no-llm-plan",
         action="store_true",
-        help="Skip LLM planning/audit calls in contractflow and use deterministic prompt compilation.",
+        help="Skip LLM planning/audit calls in v1 contractflow and use deterministic prompt compilation.",
     )
     parser.add_argument(
         "--max-singleton-retries",
         type=positive_int,
         default=2,
-        help="Singleton recovery retries for contractflow_optimized.",
+        help="Singleton recovery retries for contractflow_optimized and v2 systems.",
     )
     parser.add_argument(
         "--continue-on-error",
@@ -188,6 +202,24 @@ def generate_one(
                 task,
                 client,
                 max_output_tokens=args.direct_max_output_tokens,
+            )
+        elif system in V2_SYSTEMS:
+            cfg = FlowConfig(
+                batch_size=args.batch_size,
+                plan_max_output_tokens=args.plan_max_output_tokens,
+                plan_retry_cap_tokens=max(8_192, args.plan_max_output_tokens * 2),
+                generation_max_output_tokens=args.generation_max_output_tokens,
+                review_max_output_tokens=args.review_max_output_tokens,
+                repair_max_output_tokens=args.repair_max_output_tokens,
+                max_singleton_retries=args.max_singleton_retries,
+                use_contracts=system not in {"v2_no_contract", "v2_neither"},
+                use_review_repair=system not in {"v2_no_review_repair", "v2_neither"},
+            )
+            output = run_longgen_v2(
+                task,
+                client,
+                config=cfg,
+                checkpoint_path=run_dir / "checkpoints" / system / f"{tid}.json",
             )
         elif system == "contractflow_optimized":
             output = run_harness_optimized(
