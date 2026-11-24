@@ -396,6 +396,8 @@ USER_PROMPT:
 def parse_generated_segments(
     expected: list[SegmentContract],
     payload: dict[str, Any] | str,
+    *,
+    segment_type: str | None = None,
 ) -> dict[int, str]:
     expected_indices = {contract.index for contract in expected}
     result: dict[int, str] = {}
@@ -409,6 +411,14 @@ def parse_generated_segments(
             text = match.group(2).strip()
             if index in expected_indices and text and index not in result:
                 result[index] = text
+        if segment_type is not None and expected_indices.difference(result):
+            # Ignore benchmark markers inside complete internal tags.
+            blocks = parse_document_blocks(
+                pattern.sub("\n", payload), segment_type, official_markers_only=True,
+            )
+            for index, text in blocks.items():
+                if index in expected_indices:
+                    result.setdefault(index, text)
         return result
     raw_segments = payload.get("segments", [])
     if not isinstance(raw_segments, list):
@@ -577,11 +587,16 @@ def assemble_document(task: LongGenTask, segments: dict[int, str]) -> str:
     return "\n\n".join(blocks) + "\n\n*** finished ***"
 
 
-def parse_document_blocks(text: str, segment_type: str) -> dict[int, str]:
+def parse_document_blocks(
+    text: str, segment_type: str, *, official_markers_only: bool = False,
+) -> dict[int, str]:
     escaped = re.escape(segment_type)
-    marker = rf"(?:#\*#|###)\s*{escaped}\s+(\d+)[^:\n]*:\s*"
-    matches = list(re.finditer(marker, text, flags=re.IGNORECASE))
-    if not matches:
+    if official_markers_only:
+        marker = rf"#\*#[ \t]*{escaped}[ \t]+(\d+)\b[^:\r\n]*(?::[ \t]*|(?=\r?$))"
+    else:
+        marker = rf"(?:#\*#|###)\s*{escaped}\s+(\d+)[^:\n]*:\s*"
+    matches = list(re.finditer(marker, text, flags=re.IGNORECASE | re.MULTILINE))
+    if not matches and not official_markers_only:
         fallback = rf"(?:^|\n)\s*{escaped}\s+(\d+)[^:\n]*:\s*"
         matches = list(re.finditer(fallback, text, flags=re.IGNORECASE))
     result: dict[int, str] = {}
@@ -812,7 +827,9 @@ def run_harness(
             temperature=0.25,
             max_output_tokens=generation_max_output_tokens,
         )
-        generated = parse_generated_segments(batch, raw)
+        generated = parse_generated_segments(
+            batch, raw, segment_type=task.segment_type if use_contracts else None,
+        )
         segments.update(generated)
         generation_batches.append(
             {
@@ -920,7 +937,9 @@ def run_harness(
             temperature=0.15,
             max_output_tokens=repair_max_output_tokens,
         )
-        repaired = parse_generated_segments(batch, raw)
+        repaired = parse_generated_segments(
+            batch, raw, segment_type=task.segment_type if use_contracts else None,
+        )
         for index, text in repaired.items():
             before_words = word_count(segments.get(index, ""))
             segments[index] = text

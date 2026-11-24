@@ -110,6 +110,55 @@ def test_parse_generated_segments_supports_tagged_prose() -> None:
     assert parsed == {1: "Alpha", 2: 'Beta with "quotes"'}
 
 
+def test_generated_segments_accept_only_explicit_official_markers_as_fallback() -> None:
+    from learnbyai_research.longgenbench import parse_generated_segments
+
+    contracts = [SegmentContract(index=index) for index in (1, 2, 3, 4, 5)]
+    raw = (
+        "Unnumbered opening.\n"
+        "#*# Menu Day 1 (January 1):\nDuplicate from benchmark format.\n"
+        "<<<SEGMENT 1>>>\nAlpha\n#*# Menu Day 4:\nPart of Alpha.\n<<<END SEGMENT 1>>>\n"
+        "#*# Menu Day 2 (January 2):\nBeta.\n"
+        "#*# Menu Day 2:\nDuplicate Beta.\n"
+        "#*# Menu Day 9:\nOut of batch.\n"
+        "#*# Menu Day 3 (January 3)\nGamma.\n"
+        "*** finished ***\n"
+    )
+    tagged = {1: "Alpha\n#*# Menu Day 4:\nPart of Alpha."}
+    assert parse_generated_segments(contracts, raw) == tagged
+    assert parse_generated_segments(contracts, raw, segment_type="Menu Day") == {
+        **tagged, 2: "Beta.", 3: "Gamma.",
+    }
+    assert parse_generated_segments(
+        contracts, "Menu Day 4:\nA bare heading.", segment_type="Menu Day",
+    ) == {}
+
+
+def test_contractflow_accepts_official_format_in_generation_and_repair() -> None:
+    class OfficialFormatLLM:
+        model = "format-fixture"
+
+        def complete(self, prompt: str, **kwargs) -> str:
+            if prompt.startswith("LONGGEN_WRITE_SEGMENTS"):
+                return "#*# Week 1:\n" + "alpha " * 20
+            assert prompt.startswith("LONGGEN_REPAIR_SEGMENTS")
+            return "#*# Week 2:\n" + "beta " * 20
+
+    output = run_harness(
+        task_from_dataset_item(0, dataset_item("Week")),
+        OfficialFormatLLM(),
+        batch_size=2,
+        plan_max_output_tokens=1,
+        generation_max_output_tokens=1,
+        review_max_output_tokens=1,
+        repair_max_output_tokens=1,
+        use_llm_plan=False,
+    )
+    assert [section["index"] for section in output["segments"]] == [1, 2]
+    assert output["metadata"]["repair_records"][0]["index"] == 2
+    assert output["final_text"].count("#*# Week ") == 2
+
+
 def test_structural_issues_detects_missing_and_short_segments() -> None:
     task = task_from_dataset_item(0, dataset_item("Block"))
     contracts = [SegmentContract(index=1), SegmentContract(index=2)]
