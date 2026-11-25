@@ -94,9 +94,14 @@ class FlowConfig:
     review_max_output_tokens: int = 4_096
     repair_max_output_tokens: int = 4_096
     max_singleton_retries: int = 2
+    length_retry_ratio: float = 0.7
     rolling_state_chars: int = 800
     use_contracts: bool = True
     use_review_repair: bool = True
+
+    def __post_init__(self) -> None:
+        if not 0.0 <= self.length_retry_ratio <= 1.0:
+            raise ValueError("length_retry_ratio must be between 0.0 and 1.0")
 
 
 # ---------------------------------------------------------------------------
@@ -532,7 +537,9 @@ def build_window_review_prompt(
     ]
     return f"""CONTRACTFLOW_REVIEW_UNITS_JSON
 
-Check whether each unit clearly fulfills every listed obligation.
+Check whether each unit clearly fulfills every listed obligation in its `obligations` field.
+Treat each unit's `obligations` list as authoritative: verify ONLY whether the unit's text satisfies those obligations.
+Never question, recalculate, or reject an assigned obligation, and never ask to remove content that fulfills a listed obligation.
 Accept clear paraphrases. Do not fail a unit for minor style preferences or harmless extra detail.
 
 Return valid JSON only:
@@ -577,7 +584,7 @@ DIAGNOSED_ISSUES:
 
 REQUIREMENTS:
 - Write {unit.min_words} to {unit.max_words} words of final reader-facing prose.
-- Clearly satisfy every listed obligation.
+- Treat UNIT_OBLIGATIONS as authoritative: clearly satisfy every listed obligation and NEVER remove or omit any listed obligation even if DIAGNOSED_ISSUES questions it.
 - Return ONLY the revised prose for unit {unit.index}. Do NOT add wrapper tags, headings, or commentary.
 """
 
@@ -598,6 +605,7 @@ REQUIREMENTS:
     return f"""CONTRACTFLOW_REPAIR_UNITS
 
 Rewrite ONLY units {indices} to resolve every listed issue and include every listed obligation.
+Treat each unit's `obligations` list as authoritative: clearly satisfy every listed obligation and NEVER remove or omit any listed obligation even if `issues` questions it.
 Each revised unit must contain {min_w} to {max_w} words of reader-facing prose.
 
 Use exact tags:
@@ -893,6 +901,7 @@ def run_contractflow(
             "pipeline_version": CONTRACTFLOW_V2_VERSION,
             "requested_batch_size": cfg.batch_size,
             "effective_batch_size": eff_batch,
+            "length_retry_ratio": cfg.length_retry_ratio,
             "use_contracts": cfg.use_contracts,
             "use_review_repair": cfg.use_review_repair,
             "compiler_mode": contract.compiler_mode,
@@ -979,7 +988,8 @@ def _draft_window(
                 if calls > 1:
                     recovered_indices.append(unit.index)
             current = unit_texts.get(unit.index, "")
-            if not current or word_count(current) < unit.min_words:
+            retry_floor = _length_retry_floor(unit.min_words, cfg.length_retry_ratio)
+            if not current or word_count(current) < retry_floor:
                 need_retry.append(unit)
 
         # In open-loop ablation (use_review_repair=False), stop after the single initial draft call.
@@ -1084,8 +1094,9 @@ def _repair_units_monotonic(
             before_words = word_count(before_text)
             candidate = repaired.get(unit.index, "").strip()
             after_words = word_count(candidate)
+            min_accept_words = _length_retry_floor(unit.min_words, cfg.length_retry_ratio)
             accepted = bool(candidate) and (
-                after_words >= unit.min_words or after_words > before_words
+                after_words >= min_accept_words or after_words > before_words
             )
             if accepted:
                 unit_texts[unit.index] = candidate
@@ -1135,6 +1146,12 @@ def word_count(text: str) -> int:
     cjk = len(re.findall(r"[\u4e00-\u9fff]", text))
     latin = len(re.findall(r"\b[A-Za-z0-9][A-Za-z0-9'-]*\b", text))
     return cjk + latin
+
+
+def _length_retry_floor(min_words: int, ratio: float) -> int:
+    if min_words <= 0 or ratio <= 0.0:
+        return 0
+    return max(1, math.ceil(round(min_words * ratio, 6)))
 
 
 def check_structural_issues(

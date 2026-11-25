@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 from pathlib import Path
 from typing import Any
 
@@ -22,8 +23,12 @@ def render_longgen_document(
     task: LongGenTask,
     unit_texts: dict[int, str],
 ) -> str:
-    """Thin 1-call boundary renderer for official LongGenBench #*# output format."""
-    return assemble_document(task, unit_texts)
+    """Thin boundary renderer for official LongGenBench #*# output format."""
+    sanitized = {
+        index: re.sub(r"\s*#\*#\s*", " ", text).strip()
+        for index, text in unit_texts.items()
+    }
+    return assemble_document(task, sanitized)
 
 
 def compile_longgen_v2_contract(

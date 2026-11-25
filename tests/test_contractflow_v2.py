@@ -7,8 +7,11 @@ from pathlib import Path
 
 from learnbyai_research.contractflow_v2 import (
     ContractRule,
+    DocumentContract,
     FlowConfig,
     UnitContract,
+    build_unit_repair_prompt,
+    build_window_review_prompt,
     compile_sparse_contract,
     draft_token_budget,
     effective_batch_size,
@@ -25,7 +28,7 @@ from learnbyai_research.longgenbench_official_eval import (
     official_output_blocks,
     parse_blocks,
 )
-from learnbyai_research.longgenbench_v2 import run_longgen_v2
+from learnbyai_research.longgenbench_v2 import render_longgen_document, run_longgen_v2
 
 
 def test_expand_contract_rules_supports_all_four_scopes_and_bounded_stride() -> None:
@@ -390,3 +393,127 @@ def test_cli_v2_systems_and_compiler_diagnostic_script() -> None:
     )
     table = chk_mod.format_compiler_table(summary)
     assert "OVERALL" in table and "Floor" in table
+
+
+def test_length_retry_ratio_and_contract_authority_prompts() -> None:
+    assert FlowConfig().length_retry_ratio == 0.7
+    for bad_ratio in (-0.1, 1.1):
+        try:
+            FlowConfig(length_retry_ratio=bad_ratio)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError(f"Expected ValueError for length_retry_ratio={bad_ratio}")
+
+    contract = DocumentContract(
+        global_brief="Two concise handbook chapters.",
+        global_invariants=[],
+        unit_label="Chapter",
+        total_units=2,
+        rules=[],
+        units=[
+            UnitContract(index=1, title="Chapter 1", min_words=20, max_words=40, obligations=["cover Paxos"]),
+            UnitContract(index=2, title="Chapter 2", min_words=20, max_words=40, obligations=[]),
+        ],
+    )
+
+    review_prompt = build_window_review_prompt(contract, [contract.units[0]], {1: "draft text"})
+    assert "authoritative" in review_prompt
+    assert "Never question, recalculate, or reject an assigned obligation" in review_prompt
+
+    single_repair = build_unit_repair_prompt(
+        contract,
+        [contract.units[0]],
+        {1: "draft text"},
+        {1: {"passed": False, "missing_obligations": ["cover Paxos"], "issues": ["missing"]}},
+    )
+    assert "Treat UNIT_OBLIGATIONS as authoritative" in single_repair
+    assert "NEVER remove or omit any listed obligation" in single_repair
+
+    multi_repair = build_unit_repair_prompt(
+        contract,
+        contract.units,
+        {1: "draft 1", 2: "draft 2"},
+        {1: {"passed": False, "issues": ["missing"]}, 2: {"passed": False, "issues": ["missing"]}},
+    )
+    assert "Treat each unit's `obligations` list as authoritative" in multi_repair
+    assert "NEVER remove or omit any listed obligation" in multi_repair
+
+    class ToleranceLLM:
+        model = "tol-mock"
+
+        def __init__(self) -> None:
+            self.singleton_prompts: list[str] = []
+
+        def complete(self, prompt: str, **kwargs) -> str:
+            if "CONTRACTFLOW_DRAFT_UNITS" in prompt:
+                # Unit 1 has 16 words (>= ceil(20 * 0.7) = 14) -> must NOT retry
+                # Unit 2 has 10 words (< 14) -> MUST trigger singleton retry
+                u1 = " ".join(f"word{i}" for i in range(16))
+                u2 = " ".join(f"short{i}" for i in range(10))
+                return f"<<<UNIT 1>>>\n{u1}\n<<<END UNIT 1>>>\n<<<UNIT 2>>>\n{u2}\n<<<END UNIT 2>>>"
+            if "CONTRACTFLOW_DRAFT_SINGLE_UNIT" in prompt:
+                self.singleton_prompts.append(prompt)
+                return " ".join(f"expanded{i}" for i in range(20))
+            if "CONTRACTFLOW_REVIEW_UNITS_JSON" in prompt:
+                return json.dumps(
+                    {
+                        "results": [
+                            {
+                                "index": 1,
+                                "passed": False,
+                                "missing_obligations": ["cover Paxos"],
+                                "issues": ["missing Paxos"],
+                            }
+                        ]
+                    }
+                )
+            if "CONTRACTFLOW_REPAIR_SINGLE_UNIT" in prompt:
+                # 15 words (< before_words=16, < min_words=20, but >= 14) -> MUST be accepted
+                return "Paxos consensus protocol ensures safety " + " ".join(f"rep{i}" for i in range(10))
+            return "{}"
+
+        def completion_metadata(self) -> dict:
+            return {"finish_reason": "stop"}
+
+        def completion_history(self) -> list[dict]:
+            return []
+
+    llm = ToleranceLLM()
+    result = run_contractflow(
+        "Write 2 chapters.",
+        llm,
+        config=FlowConfig(batch_size=2, length_retry_ratio=0.7, use_contracts=True, use_review_repair=True),
+        precompiled_contract=contract,
+    )
+    assert result["metadata"]["length_retry_ratio"] == 0.7
+    assert len(llm.singleton_prompts) == 1
+    assert "unit 2" in llm.singleton_prompts[0].lower()
+    assert result["metadata"]["window_records"][0]["recovered_indices"] == [2]
+    assert result["metadata"]["repair_records"][0]["accepted"] is True
+    assert "Paxos" in result["units"][0]["text"]
+
+
+def test_render_longgen_document_strips_stray_delimiters() -> None:
+    item = {
+        "prompt": "Write 2 menu days. Use '#*#' to separate days.",
+        "type": "Menu Day",
+        "number": 2,
+        "prefix": "#*# Menu Day 1:",
+        "checks_once": {"1": "Burger Mondays"},
+        "checks_range": {},
+        "checks_periodic": {},
+    }
+    task = task_from_dataset_item(0, item)
+    rendered = render_longgen_document(
+        task,
+        {
+            1: "Menu Day 1:\n#*# Burger Mondays features a gourmet beef burger and fries.",
+            2: "#*# Soup and Salad\n#*# Rich chocolate cake for dessert.",
+        },
+    )
+    blocks = parse_blocks(official_output_blocks(rendered), "Menu Day")
+    assert completion_rate(blocks, 2) == 100.0
+    assert "Burger Mondays" in blocks[1]
+    assert "chocolate cake" in blocks[2]
+
