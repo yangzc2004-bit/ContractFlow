@@ -1,23 +1,31 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import sys
+import threading
+import time
 import traceback
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from learnbyai_research.contractflow_v2 import FlowConfig
-from learnbyai_research.llm import OpenAICompatibleClient
+from learnbyai_research.contractflow_v2 import (
+    DocumentContract,
+    FlowConfig,
+    contract_from_dict,
+)
+from learnbyai_research.llm import ChatModel, OpenAICompatibleClient, completion_history
 from learnbyai_research.longgenbench import (
+    LongGenTask,
     load_dataset,
     run_direct,
     run_harness,
@@ -27,7 +35,10 @@ from learnbyai_research.longgenbench import (
     task_record,
 )
 from learnbyai_research.longgenbench_optimized import run_harness_optimized
-from learnbyai_research.longgenbench_v2 import run_longgen_v2
+from learnbyai_research.longgenbench_v2 import (
+    compile_longgen_v2_contract,
+    run_longgen_v2,
+)
 
 
 V2_SYSTEMS = {
@@ -36,6 +47,72 @@ V2_SYSTEMS = {
     "v2_no_review_repair",
     "v2_neither",
 }
+
+_CONTRACT_CACHE_LOCK = threading.Lock()
+_CONTRACT_KEY_LOCKS: dict[str, threading.Lock] = {}
+
+
+def _contract_lock(key: str) -> threading.Lock:
+    with _CONTRACT_CACHE_LOCK:
+        lock = _CONTRACT_KEY_LOCKS.get(key)
+        if lock is None:
+            lock = threading.Lock()
+            _CONTRACT_KEY_LOCKS[key] = lock
+        return lock
+
+
+def load_or_compile_v2_contract(
+    cache_dir: Path,
+    task: LongGenTask,
+    cfg: FlowConfig,
+    client_factory: Callable[[], ChatModel],
+) -> tuple[DocumentContract, list[dict[str, Any]], float, bool, Path]:
+    tid = task_id(task)
+    cache_path = cache_dir / f"{tid}.json"
+    prompt_hash = hashlib.sha256(task.prompt.encode("utf-8")).hexdigest()
+    lock = _contract_lock(str(cache_path.resolve()))
+    with lock:
+        if cache_path.exists():
+            data = json.loads(cache_path.read_text(encoding="utf-8"))
+            stored_hash = data.get("prompt_hash")
+            if stored_hash and stored_hash != prompt_hash:
+                raise ValueError(
+                    f"contract cache {cache_path} belongs to a different prompt"
+                )
+            if isinstance(data.get("contract"), dict):
+                contract = contract_from_dict(data["contract"])
+                history = list(data.get("compile_history", []))
+                elapsed = float(data.get("compile_elapsed_seconds", 0.0))
+            elif isinstance(data.get("contract_v2"), dict):
+                contract = contract_from_dict(data["contract_v2"])
+                meta = data.get("metadata", {})
+                history = list(meta.get("shared_compile_history", []))
+                elapsed = float(meta.get("shared_compile_elapsed_seconds", 0.0))
+            else:
+                raise ValueError(f"unrecognized contract cache format: {cache_path}")
+            return contract, history, elapsed, True, cache_path
+
+        compile_client = client_factory()
+        started = time.perf_counter()
+        contract = compile_longgen_v2_contract(
+            task,
+            compile_client,
+            max_output_tokens=cfg.plan_max_output_tokens,
+            retry_cap_tokens=cfg.plan_retry_cap_tokens,
+        )
+        elapsed = round(time.perf_counter() - started, 4)
+        history = completion_history(compile_client)
+        write_json(
+            cache_path,
+            {
+                "task_id": tid,
+                "prompt_hash": prompt_hash,
+                "contract": contract.to_dict(),
+                "compile_elapsed_seconds": elapsed,
+                "compile_history": history,
+            },
+        )
+        return contract, history, elapsed, False, cache_path
 
 
 def positive_int(value: str) -> int:
@@ -129,6 +206,11 @@ def build_parser() -> argparse.ArgumentParser:
         help="Singleton recovery retries for contractflow_optimized and v2 systems.",
     )
     parser.add_argument(
+        "--contract-cache-dir",
+        default=None,
+        help="Optional directory to cache and share compiled v2 contracts across systems (e.g., v2_contractflow and v2_no_review_repair).",
+    )
+    parser.add_argument(
         "--continue-on-error",
         action="store_true",
         help="Record task failures under errors/<system>/ and continue remaining jobs.",
@@ -215,12 +297,42 @@ def generate_one(
                 use_contracts=system not in {"v2_no_contract", "v2_neither"},
                 use_review_repair=system not in {"v2_no_review_repair", "v2_neither"},
             )
+            precompiled_contract = None
+            shared_compile_history: list[dict[str, Any]] = []
+            shared_compile_elapsed = 0.0
+            contract_cache_path: Path | None = None
+            contract_cache_hit: bool | None = None
+            if cfg.use_contracts and getattr(args, "contract_cache_dir", None):
+                (
+                    precompiled_contract,
+                    shared_compile_history,
+                    shared_compile_elapsed,
+                    contract_cache_hit,
+                    contract_cache_path,
+                ) = load_or_compile_v2_contract(
+                    Path(args.contract_cache_dir),
+                    task,
+                    cfg,
+                    lambda: OpenAICompatibleClient.from_env("AUTHOR"),
+                )
             output = run_longgen_v2(
                 task,
                 client,
                 config=cfg,
+                precompiled_contract=precompiled_contract,
                 checkpoint_path=run_dir / "checkpoints" / system / f"{tid}.json",
             )
+            if contract_cache_path is not None:
+                meta = output.setdefault("metadata", {})
+                meta["contract_cache_path"] = str(contract_cache_path)
+                meta["contract_cache_hit"] = contract_cache_hit
+                meta["shared_compile_elapsed_seconds"] = shared_compile_elapsed
+                meta["shared_compile_history"] = shared_compile_history
+                if shared_compile_history:
+                    meta["completion_history"] = [
+                        *shared_compile_history,
+                        *meta.get("completion_history", []),
+                    ]
         elif system == "contractflow_optimized":
             output = run_harness_optimized(
                 task,

@@ -517,3 +517,169 @@ def test_render_longgen_document_strips_stray_delimiters() -> None:
     assert "Burger Mondays" in blocks[1]
     assert "chocolate cake" in blocks[2]
 
+
+def test_v2_no_contract_runs_prompt_based_semantic_review_and_repair() -> None:
+    raw_request = "NO_CONTRACT_SENTINEL: Write 4 chapters. Chapter 2 must explain leader election."
+
+    class PromptRefineMockLLM:
+        model = "no-contract-mock"
+
+        def __init__(self) -> None:
+            self.prompts: list[str] = []
+            self.reviewed_indices: list[int] = []
+            self.repaired_prompts: list[str] = []
+
+        def complete(self, prompt: str, **kwargs) -> str:
+            self.prompts.append(prompt)
+            if "CONTRACTFLOW_DRAFT_UNITS" in prompt:
+                match = re.search(r"Write ONLY the requested units: (\[[^\]]+\])", prompt)
+                indices = json.loads(match.group(1))
+                return "\n".join(
+                    f"<<<UNIT {idx}>>>\n"
+                    + f"Chapter {idx} discusses general distributed systems concepts "
+                    + ("alpha " * 18)
+                    + f"\n<<<END UNIT {idx}>>>"
+                    for idx in indices
+                )
+            if "CONTRACTFLOW_REVIEW_UNITS_JSON" in prompt:
+                assert "USER_REQUEST:" in prompt
+                assert "NO_CONTRACT_SENTINEL" in prompt
+                raw_json = prompt.split("UNITS_JSON:\n", 1)[1].strip()
+                items = json.loads(raw_json)
+                assert all("obligations" not in item for item in items)
+                results = []
+                for item in items:
+                    idx = int(item["index"])
+                    self.reviewed_indices.append(idx)
+                    if idx == 3:
+                        # Deliberately omit index 3 to verify no-contract mode does not destructively rewrite omitted units
+                        continue
+                    if idx == 2:
+                        results.append(
+                            {
+                                "index": 2,
+                                "passed": False,
+                                "missing_obligations": ["explain leader election"],
+                                "issues": ["Chapter 2 did not explain leader election"],
+                            }
+                        )
+                    else:
+                        results.append(
+                            {"index": idx, "passed": True, "missing_obligations": [], "issues": []}
+                        )
+                return json.dumps({"results": results})
+            if "CONTRACTFLOW_REPAIR_SINGLE_UNIT" in prompt or "CONTRACTFLOW_REPAIR_UNITS" in prompt:
+                self.repaired_prompts.append(prompt)
+                assert "USER_REQUEST:" in prompt
+                assert "NO_CONTRACT_SENTINEL" in prompt
+                assert "UNIT_OBLIGATIONS:" not in prompt
+                return "Revised Chapter 2 clearly explaining leader election and Raft terms " + ("beta " * 18)
+            return "{}"
+
+        def completion_metadata(self) -> dict:
+            return {"finish_reason": "stop"}
+
+        def completion_history(self) -> list[dict]:
+            return []
+
+    llm = PromptRefineMockLLM()
+    result = run_contractflow(
+        raw_request,
+        llm,
+        config=FlowConfig(batch_size=2, use_contracts=False, use_review_repair=True),
+        total_units=4,
+        unit_label="Chapter",
+        min_words=20,
+        max_words=40,
+    )
+    assert result["system"] == "v2_no_contract"
+    assert not any("CONTRACTFLOW_SPARSE_CONTRACT_JSON" in p for p in llm.prompts)
+    # Without contracts, reviewer inspects ALL units in each window (no sparse skipping)
+    assert sorted(llm.reviewed_indices) == [1, 2, 3, 4]
+    # Only unit 2 failed and was repaired; omitted unit 3 was NOT destructively rewritten
+    assert len(llm.repaired_prompts) == 1
+    assert len(result["metadata"]["repair_records"]) == 1
+    assert result["metadata"]["repair_records"][0]["index"] == 2
+    assert result["metadata"]["repair_records"][0]["accepted"] is True
+    assert "leader election" in result["units"][1]["text"]
+
+
+def test_run_longgenbench_shared_contract_cache(tmp_path) -> None:
+    root = Path(__file__).resolve().parents[1]
+    run_spec = importlib.util.spec_from_file_location("run_lg_cache", root / "scripts" / "run_longgenbench.py")
+    assert run_spec is not None and run_spec.loader is not None
+    run_mod = importlib.util.module_from_spec(run_spec)
+    run_spec.loader.exec_module(run_mod)
+
+    args = run_mod.build_parser().parse_args(
+        [
+            "--dataset",
+            "dummy.json",
+            "--run-dir",
+            str(tmp_path / "run"),
+            "--systems",
+            "v2_contractflow",
+            "v2_no_review_repair",
+            "--per-type",
+            "1",
+            "--contract-cache-dir",
+            str(tmp_path / "cache"),
+        ]
+    )
+    assert args.contract_cache_dir == str(tmp_path / "cache")
+
+    item = {
+        "prompt": "Design a 4-floor tower. Floor 2 has a gym. Each floor at least 20 words.",
+        "type": "Floor",
+        "number": 4,
+        "prefix": "#*# Floor 1:",
+        "checks_once": {"2": "gym"},
+        "checks_range": {},
+        "checks_periodic": {},
+    }
+    task = task_from_dataset_item(0, item)
+    cfg = FlowConfig(batch_size=2, use_contracts=True, use_review_repair=True)
+    cache_dir = tmp_path / "cache"
+
+    compile_calls = 0
+
+    def make_client() -> MockV2FlowLLM:
+        nonlocal compile_calls
+        compile_calls += 1
+        return MockV2FlowLLM()
+
+    c1, hist1, _e1, hit1, path1 = run_mod.load_or_compile_v2_contract(cache_dir, task, cfg, make_client)
+    assert hit1 is False
+    assert compile_calls == 1
+    assert path1.exists()
+    assert len(hist1) == 1
+
+    c2, hist2, _e2, hit2, path2 = run_mod.load_or_compile_v2_contract(cache_dir, task, cfg, make_client)
+    assert hit2 is True
+    assert compile_calls == 1
+    assert path2 == path1
+    assert c2.to_dict() == c1.to_dict()
+    assert hist2 == hist1
+
+    # Different prompt with same task_id must fail fast instead of silently reusing wrong contract
+    other_task = task_from_dataset_item(0, {**item, "prompt": "Different tower prompt entirely."})
+    try:
+        run_mod.load_or_compile_v2_contract(cache_dir, other_task, cfg, make_client)
+    except ValueError as err:
+        assert "different prompt" in str(err)
+    else:
+        raise AssertionError("Expected ValueError for prompt_hash mismatch in contract cache")
+
+    # Loading an existing generation JSON containing contract_v2 also works
+    legacy_dir = tmp_path / "legacy_gen"
+    legacy_dir.mkdir(parents=True, exist_ok=True)
+    (legacy_dir / path1.name).write_text(
+        json.dumps({"contract_v2": c1.to_dict(), "metadata": {"shared_compile_history": hist1}}),
+        encoding="utf-8",
+    )
+    c3, hist3, _e3, hit3, _p3 = run_mod.load_or_compile_v2_contract(legacy_dir, task, cfg, make_client)
+    assert hit3 is True
+    assert c3.to_dict() == c1.to_dict()
+    assert hist3 == hist1
+
+

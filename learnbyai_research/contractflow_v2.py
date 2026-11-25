@@ -525,7 +525,40 @@ def build_window_review_prompt(
     contract: DocumentContract,
     targets: list[UnitContract],
     unit_texts: dict[int, str],
+    *,
+    use_contracts: bool = True,
 ) -> str:
+    if not use_contracts:
+        items = [
+            {
+                "index": unit.index,
+                "title": unit.title,
+                "text": unit_texts.get(unit.index, ""),
+            }
+            for unit in targets
+        ]
+        return f"""CONTRACTFLOW_REVIEW_UNITS_JSON
+
+Check each unit below against ALL requirements in USER_REQUEST that apply to that specific unit index or range (including one-off events, range constraints, periodic/recurring constraints, and general requirements).
+Return one result object for EVERY unit in UNITS_JSON.
+If a unit satisfies every requirement in USER_REQUEST that applies to it (or if no special constraint applies to that unit and it is coherent), mark `"passed": true`.
+Only mark `"passed": false` when a unit clearly misses or violates a requirement from USER_REQUEST that applies to that unit, and list the missing requirements in `missing_obligations` and `issues`.
+Accept clear paraphrases. Do not fail a unit for minor style preferences or harmless extra detail.
+
+Return valid JSON only:
+{{
+  "results": [
+    {{"index": 1, "passed": true, "missing_obligations": [], "issues": []}}
+  ]
+}}
+
+USER_REQUEST:
+{contract.global_brief}
+
+UNITS_JSON:
+{json.dumps(items, ensure_ascii=False)}
+"""
+
     items = [
         {
             "index": unit.index,
@@ -562,10 +595,31 @@ def build_unit_repair_prompt(
     targets: list[UnitContract],
     unit_texts: dict[int, str],
     issues: dict[int, dict[str, Any]],
+    *,
+    use_contracts: bool = True,
 ) -> str:
     if len(targets) == 1:
         unit = targets[0]
         issue = issues.get(unit.index, {})
+        if not use_contracts:
+            return f"""CONTRACTFLOW_REPAIR_SINGLE_UNIT
+
+Rewrite unit {unit.index} ({unit.title}) to fix every listed issue while preserving valid details.
+
+USER_REQUEST:
+{contract.global_brief}
+
+CURRENT_TEXT:
+{unit_texts.get(unit.index, "")}
+
+DIAGNOSED_ISSUES:
+{json.dumps(issue, ensure_ascii=False)}
+
+REQUIREMENTS:
+- Write {unit.min_words} to {unit.max_words} words of final reader-facing prose.
+- Resolve every issue in DIAGNOSED_ISSUES and clearly satisfy all requirements in USER_REQUEST that apply to unit {unit.index}.
+- Return ONLY the revised prose for unit {unit.index}. Do NOT add wrapper tags, headings, or commentary.
+"""
         return f"""CONTRACTFLOW_REPAIR_SINGLE_UNIT
 
 Rewrite unit {unit.index} ({unit.title}) to fix every listed issue while preserving valid details.
@@ -591,6 +645,34 @@ REQUIREMENTS:
     indices = [unit.index for unit in targets]
     min_w = targets[0].min_words
     max_w = targets[0].max_words
+    example_idx = indices[0]
+    if not use_contracts:
+        items = [
+            {
+                "index": unit.index,
+                "title": unit.title,
+                "current_text": unit_texts.get(unit.index, ""),
+                "issues": issues.get(unit.index, {}),
+            }
+            for unit in targets
+        ]
+        return f"""CONTRACTFLOW_REPAIR_UNITS
+
+Rewrite ONLY units {indices} to resolve every listed issue and satisfy all requirements in USER_REQUEST that apply to those units.
+Each revised unit must contain {min_w} to {max_w} words of reader-facing prose.
+
+Use exact tags:
+<<<UNIT {example_idx}>>>
+revised prose
+<<<END UNIT {example_idx}>>>
+
+USER_REQUEST:
+{contract.global_brief}
+
+FAILING_UNITS_JSON:
+{json.dumps(items, ensure_ascii=False)}
+"""
+
     items = [
         {
             "index": unit.index,
@@ -601,7 +683,6 @@ REQUIREMENTS:
         }
         for unit in targets
     ]
-    example_idx = indices[0]
     return f"""CONTRACTFLOW_REPAIR_UNITS
 
 Rewrite ONLY units {indices} to resolve every listed issue and include every listed obligation.
@@ -821,27 +902,42 @@ def run_contractflow(
             }
         )
 
-        # Online Tier-2 contract verification + localized repair for THIS window before advancing state
-        if cfg.use_contracts and cfg.use_review_repair:
-            constrained = [u for u in window if u.obligations and u.index in unit_texts]
-            if constrained:
+        # Online verification + localized repair for THIS window before advancing state.
+        # With contracts: sparse review on constrained units only.
+        # Without contracts: prompt-based full-window review (chunked self-refine ablation).
+        if cfg.use_review_repair:
+            review_targets = (
+                [u for u in window if u.obligations and u.index in unit_texts]
+                if cfg.use_contracts
+                else [u for u in window if u.index in unit_texts]
+            )
+            if review_targets:
                 batch_review = _review_units_resilient(
                     contract,
-                    constrained,
+                    review_targets,
                     unit_texts,
                     reviewer,
                     review_cap_tokens=cfg.review_max_output_tokens,
+                    use_contracts=cfg.use_contracts,
                 )
                 failing: list[UnitContract] = []
                 failing_issues: dict[int, dict[str, Any]] = {}
-                for unit in constrained:
+                for unit in review_targets:
                     rec = batch_review.get(unit.index)
                     if rec is None:
-                        rec = {
-                            "passed": False,
-                            "missing_obligations": list(unit.obligations),
-                            "issues": ["review result missing"],
-                        }
+                        rec = (
+                            {
+                                "passed": False,
+                                "missing_obligations": list(unit.obligations),
+                                "issues": ["review result missing"],
+                            }
+                            if cfg.use_contracts
+                            else {
+                                "passed": True,
+                                "missing_obligations": [],
+                                "issues": ["review result omitted"],
+                            }
+                        )
                     review_records.append({"index": unit.index, **rec})
                     if not rec["passed"]:
                         failing.append(unit)
@@ -1020,13 +1116,21 @@ def _review_units_resilient(
     llm: ChatModel,
     *,
     review_cap_tokens: int,
+    use_contracts: bool = True,
 ) -> dict[int, dict[str, Any]]:
     budget = review_token_budget(len(targets), review_cap_tokens)
+    system_msg = (
+        "You verify document units against explicit obligations. Return valid JSON only."
+        if use_contracts
+        else "You verify document units against the user's original request. Return valid JSON only."
+    )
     try:
         payload = _complete_json_resilient(
             llm,
-            build_window_review_prompt(contract, targets, unit_texts),
-            system="You verify document units against explicit obligations. Return valid JSON only.",
+            build_window_review_prompt(
+                contract, targets, unit_texts, use_contracts=use_contracts
+            ),
+            system=system_msg,
             temperature=0.0,
             max_output_tokens=budget,
             retry_cap_tokens=review_cap_tokens,
@@ -1036,16 +1140,26 @@ def _review_units_resilient(
         if len(targets) > 1:
             mid = len(targets) // 2
             left = _review_units_resilient(
-                contract, targets[:mid], unit_texts, llm, review_cap_tokens=review_cap_tokens
+                contract,
+                targets[:mid],
+                unit_texts,
+                llm,
+                review_cap_tokens=review_cap_tokens,
+                use_contracts=use_contracts,
             )
             right = _review_units_resilient(
-                contract, targets[mid:], unit_texts, llm, review_cap_tokens=review_cap_tokens
+                contract,
+                targets[mid:],
+                unit_texts,
+                llm,
+                review_cap_tokens=review_cap_tokens,
+                use_contracts=use_contracts,
             )
             return {**left, **right}
         unit = targets[0]
         return {
             unit.index: {
-                "passed": False,
+                "passed": not use_contracts,
                 "missing_obligations": list(unit.obligations),
                 "issues": ["review json parsing failed"],
             }
@@ -1069,7 +1183,9 @@ def _repair_units_monotonic(
         batch = queue.pop(0)
         max_w = max(u.max_words for u in batch)
         budget = repair_token_budget(len(batch), max_w, cfg.repair_max_output_tokens)
-        prompt = build_unit_repair_prompt(contract, batch, unit_texts, issues)
+        prompt = build_unit_repair_prompt(
+            contract, batch, unit_texts, issues, use_contracts=cfg.use_contracts
+        )
         system_msg = (
             "Return only revised clean prose for the requested unit."
             if len(batch) == 1
@@ -1290,7 +1406,7 @@ def _chunked(items: list[Any], size: int) -> Iterable[list[Any]]:
         yield items[start : start + step]
 
 
-def _contract_from_dict(data: dict[str, Any]) -> DocumentContract:
+def contract_from_dict(data: dict[str, Any]) -> DocumentContract:
     rules = [
         ContractRule(
             scope=item["scope"],
@@ -1324,6 +1440,9 @@ def _contract_from_dict(data: dict[str, Any]) -> DocumentContract:
         units=units,
         compiler_mode=str(data.get("compiler_mode", "sparse_ir")),
     )
+
+
+_contract_from_dict = contract_from_dict
 
 
 def _load_v2_checkpoint(path: str | Path | None, prompt_hash: str) -> dict[str, Any] | None:
