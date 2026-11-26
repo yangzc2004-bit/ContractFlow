@@ -698,6 +698,8 @@ def test_multilingual_word_count_and_language_agnostic_prompts() -> None:
 
     compile_prompt = build_sparse_contract_prompt("请撰写一份分布式存储设计文档。")
     assert "strictly in the same language as USER_REQUEST" in compile_prompt
+    assert "Preserve every proper noun" in compile_prompt
+    assert "outer section-heading or delimiter formatting syntax" in compile_prompt
     assert "proportional to the requested document length" in compile_prompt
 
     contract = DocumentContract(
@@ -714,12 +716,14 @@ def test_multilingual_word_count_and_language_agnostic_prompts() -> None:
     window_prompt = build_window_draft_prompt(contract, contract.units, rolling_state="")
     assert "strictly in the same language as GLOBAL_BRIEF" in window_prompt
     assert "characters for non-space-delimited scripts" in window_prompt
+    assert "do NOT exceed 800" in window_prompt
     assert "boilerplate" in window_prompt
     assert "horizontal rules" in window_prompt
 
     single_prompt = build_singleton_draft_prompt(contract, contract.units[0], rolling_state="")
     assert "strictly in the same language as GLOBAL_BRIEF" in single_prompt
     assert "characters for non-space-delimited scripts" in single_prompt
+    assert "do NOT exceed 800" in single_prompt
     assert "horizontal rules" in single_prompt
 
     repair_contract = build_unit_repair_prompt(

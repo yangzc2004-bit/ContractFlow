@@ -1021,20 +1021,43 @@ def render_formatted_document(
     language: LanguageCode,
 ) -> str:
     if output_format_id == "markdown_open":
-        cleaned_texts = {
-            unit.index: _sanitize_unit_body(
-                unit_texts.get(unit.index, ""),
-                tag=_unit_tag_template(contract.unit_label, language, str(unit.index)),
+        blocks: list[str] = []
+        leading_atx_re = re.compile(r"^#{1,3}\s+([^\n]+?)\s*(?:\n+|$)")
+        unit_marker_re = re.compile(
+            r"^(?:第\s*[0-9一二三四五六七八九十百千万]+\s*\S+|(?:Chapter|Section|Article|Part)\s+\d+)",
+            flags=re.IGNORECASE,
+        )
+        for unit in contract.units:
+            raw_text = unit_texts.get(unit.index, "").strip()
+            if not raw_text:
+                continue
+            tag = _unit_tag_template(contract.unit_label, language, str(unit.index))
+            body = _sanitize_unit_body(
+                raw_text,
+                tag=tag,
                 unit_label=contract.unit_label,
                 index=unit.index,
                 title=unit.title,
             )
-            for unit in contract.units
-            if unit.index in unit_texts
-        }
-        return render_markdown_document(contract, cleaned_texts)
+            if not body:
+                continue
+            generic_title = f"{contract.unit_label} {unit.index}"
+            heading = tag if unit.title.strip() in ("", generic_title) else unit.title.strip()
+            m_atx = leading_atx_re.match(body)
+            if m_atx:
+                sub = m_atx.group(1).strip()
+                rest = body[m_atx.end():].strip()
+                if rest:
+                    body = rest
+                    if unit_marker_re.match(sub):
+                        heading = sub
+                    elif unit.title.strip() in ("", generic_title):
+                        sep = "：" if language == "zh" else ": "
+                        heading = f"{tag}{sep}{sub}"
+            blocks.append(f"## {heading}\n\n{body}")
+        return "\n\n".join(blocks)
 
-    blocks: list[str] = []
+    blocks = []
     for unit in contract.units:
         raw_text = unit_texts.get(unit.index, "").strip()
         if not raw_text:
@@ -1175,6 +1198,8 @@ def _format_hygiene_issues(text: str) -> list[str]:
         text,
     ):
         issues.append("duplicate_consecutive_headings")
+    if re.search(r"(?m)^##\s+[^\n]+\s*\n(?:\s*\n)*##\s+[^\n]+\s*$", text):
+        issues.append("stacked_markdown_headings")
     return issues
 
 

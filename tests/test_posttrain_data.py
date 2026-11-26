@@ -348,6 +348,32 @@ def test_render_formatted_document_strips_duplicate_headings_and_separators() ->
     )
     assert rendered_h2 == "## 第 1 集：\n\n这是正式正文内容。"
 
+    # markdown_open: generic "章 1" -> idiomatic "## 第 1 章", and promote leading "## 第一章：..." without stacking
+    open_contract = DocumentContract(
+        global_brief="太空打捞科幻小说。",
+        global_invariants=[],
+        unit_label="章",
+        total_units=2,
+        rules=[],
+        units=[
+            UnitContract(index=1, title="章 1", min_words=50, max_words=100),
+            UnitContract(index=2, title="章 2", min_words=50, max_words=100),
+        ],
+    )
+    rendered_open = render_formatted_document(
+        open_contract,
+        {
+            1: "## 第一章：木星边缘的静默契约\n\n晨昏线号在木星轨道附近失联。",
+            2: "调查团队启程前往目标坐标。",
+        },
+        output_format_id="markdown_open",
+        language="zh",
+    )
+    assert "## 章 1" not in rendered_open
+    assert "## 章 2" not in rendered_open
+    assert rendered_open.startswith("## 第一章：木星边缘的静默契约\n\n晨昏线号在木星轨道附近失联。")
+    assert "## 第 2 章\n\n调查团队启程前往目标坐标。" in rendered_open
+
 
 def test_open_a1_calibrates_unit_word_budgets_to_target_length(tmp_path) -> None:
     class MockOpenA1LLM:
@@ -456,15 +482,17 @@ def test_evaluate_sample_quality_6_gates_language_and_hygiene() -> None:
     assert q_zh_pass["cjk_ratio"] >= 0.45
     assert q_zh_pass["format_hygiene_issues"] == []
 
-    # 4) Duplicate consecutive headings, double --- separators, and leftover tags fail Gate 6
+    # 4) Duplicate consecutive headings, stacked ## headings, double --- separators, and leftover tags fail Gate 6
     dirty_text = (
         "**第 1 集**\n\n**第 1 集**\n\n"
+        + "## 章 1\n\n## 第一章：引子\n\n"
         + zh_clean
         + "\n\n---\n\n---\n\n<<<UNIT 2>>>"
     )
     q_dirty = evaluate_sample_quality(zh_record, {**base_result, "final_text": dirty_text})
     assert q_dirty["passed"] is False
     assert "duplicate_consecutive_headings" in q_dirty["format_hygiene_issues"]
+    assert "stacked_markdown_headings" in q_dirty["format_hygiene_issues"]
     assert "duplicate_hr_separators" in q_dirty["format_hygiene_issues"]
     assert "leftover_unit_tags" in q_dirty["format_hygiene_issues"]
 

@@ -232,7 +232,8 @@ Return valid JSON only with this exact schema:
 Rules for accuracy:
 - Use only four scopes: "all", "single", "range", or "every".
 - Extract EVERY explicit localized requirement stated in USER_REQUEST into "rules".
-- Put general style/consistency/domain rules into "global_invariants" (or scope "all"), NOT into localized rules.
+- Put general style/consistency/domain rules into "global_invariants" (or scope "all"), NOT into localized rules, and do NOT duplicate them as full-document "range" or "every" rules.
+- Do NOT put outer section-heading or delimiter formatting syntax (such as Markdown `##`, `**...**`, or `---` separators) into "global_invariants" or "rules", because section framing is handled externally.
 - All unit indices are 1-based (1 through total_units).
 - Read starting baselines, numbering order, and inclusive bounds carefully.
 - For "every" rules, leave "end" as null whenever USER_REQUEST does not state an explicit stopping bound; do NOT guess or invent a cutoff.
@@ -241,6 +242,7 @@ Rules for accuracy:
 - If a rule spans positions separated by a constant stride (e.g., jumping by a fixed offset along a schedule or 2D grid), use scope "every" with exact "start", "end", and "step".
 - Keep each "obligation" concrete, faithful to USER_REQUEST, and free of invented details.
 - Write "global_brief", "unit_titles", "global_invariants", and every "obligation" strictly in the same language as USER_REQUEST.
+- Preserve every proper noun, entity/project/organization/character name, and core premise from USER_REQUEST verbatim in "global_brief" (never drop or translate named entities).
 - When "total_units" is not explicitly fixed in USER_REQUEST, choose a natural number of chapters/sections proportional to the requested document length (roughly 500-1,200 words or CJK characters per unit).
 - Leave "unit_titles" empty ({{}}) unless specific chapter/section titles are requested or helpful for open-ended writing.
 {unit_hint}
@@ -469,7 +471,7 @@ ROLLING_STATE (recent context for continuity):
 REQUIREMENTS:
 - Output every requested index exactly once.
 - Write all prose strictly in the same language as GLOBAL_BRIEF.
-- Each unit must contain {min_w} to {max_w} words (or characters for non-space-delimited scripts such as CJK) of final reader-facing prose.
+- Each unit must stay strictly within {min_w} to {max_w} words (or characters for non-space-delimited scripts such as CJK) of final reader-facing prose; do NOT exceed {max_w}.
 - Fulfill every listed obligation naturally in its assigned unit.
 - Vary phrasing, structure, and concrete details across units; do not copy boilerplate sentences verbatim from previous units.
 - Do not include wrapper markdown headings, horizontal rules (`---` / `===`), or benchmark markers inside the prose.
@@ -521,7 +523,7 @@ UNIT_OBLIGATIONS (must be clearly included):
 {note_section}
 REQUIREMENTS:
 - Write strictly in the same language as GLOBAL_BRIEF.
-- Write {unit.min_words} to {unit.max_words} words (or characters for non-space-delimited scripts such as CJK) of final reader-facing prose.
+- Stay strictly within {unit.min_words} to {unit.max_words} words (or characters for non-space-delimited scripts such as CJK) of final reader-facing prose; do NOT exceed {unit.max_words}.
 - Vary phrasing and concrete details; do not copy boilerplate sentences verbatim from previous units.
 - Return ONLY the prose for unit {unit.index}. Do NOT add wrapper tags, headings, horizontal rules, or commentary.
 """
