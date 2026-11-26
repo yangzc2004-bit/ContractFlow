@@ -77,6 +77,11 @@ def build_parser() -> argparse.ArgumentParser:
         default="responses",
         help="API wire protocol (default: responses).",
     )
+    parser.add_argument(
+        "--reasoning-effort",
+        default=None,
+        help="Optional Responses API reasoning effort (e.g., none, low, medium).",
+    )
     parser.add_argument("--timeout", type=positive_int, default=120)
     parser.add_argument(
         "--leakage-ref",
@@ -98,7 +103,8 @@ def make_prompt_client(args: argparse.Namespace) -> OpenAICompatibleClient:
     prefix = args.env_prefix
     api_key = args.api_key or os.environ.get(f"{prefix}_API_KEY") or os.environ.get("OPENAI_API_KEY")
     base_url = args.base_url or os.environ.get(f"{prefix}_BASE_URL") or os.environ.get("OPENAI_BASE_URL")
-    model = args.model or os.environ.get(f"{prefix}_MODEL") or os.environ.get("OPENAI_MODEL") or "deepseek-v4.1-flash"
+    model = args.model or os.environ.get(f"{prefix}_MODEL") or os.environ.get("OPENAI_MODEL") or "deepseek-flash"
+    reasoning_effort = args.reasoning_effort or os.environ.get(f"{prefix}_REASONING_EFFORT") or os.environ.get("OPENAI_REASONING_EFFORT")
     if not api_key:
         raise RuntimeError(f"API key required via {prefix}_API_KEY, OPENAI_API_KEY, or --api-key.")
     if not base_url:
@@ -108,6 +114,7 @@ def make_prompt_client(args: argparse.Namespace) -> OpenAICompatibleClient:
         api_key=api_key,
         base_url=base_url.rstrip("/"),
         wire_api=args.wire_api,
+        reasoning_effort=reasoning_effort,
         timeout=args.timeout,
     )
 

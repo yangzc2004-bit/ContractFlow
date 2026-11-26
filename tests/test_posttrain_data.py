@@ -155,6 +155,8 @@ def test_seed_generation_prompt_polishing_fidelity_and_leakage_gate(tmp_path) ->
     assert llm.render_calls == 2
     assert errs == []
     assert verify_prompt_fidelity(b1_spec, prompt_text) == []
+    slot_leak_errs = verify_prompt_fidelity(b1_spec, prompt_text + " Make sure to fulfill G1 and S1.")
+    assert any("leaked internal slot IDs" in e for e in slot_leak_errs)
 
     # Leakage reference check catches test-set overlap and forbidden markers
     ref_file = tmp_path / "ref_test.json"

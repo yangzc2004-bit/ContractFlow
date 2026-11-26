@@ -205,32 +205,41 @@ LENGTH_TIER_SPECS: dict[LengthTier, dict[str, Any]] = {
 }
 
 
+def _unit_tag_template(label: str, language: LanguageCode, idx_placeholder: str = "i") -> str:
+    if language == "zh":
+        # Measure-word labels (讲/集/章/条) read naturally as "第 i 讲"; noun labels (模块/展厅/日志/班次) as "模块 i"
+        if len(label) == 1:
+            return f"第 {idx_placeholder} {label}"
+        return f"{label} {idx_placeholder}"
+    return f"{label} {idx_placeholder}"
+
+
 # 5 diverse output formats for Bucket B (strictly NO benchmark-specific "#*#" delimiter)
 STRUCTURED_FORMATS: tuple[dict[str, str], ...] = (
     {
         "format_id": "markdown_h2",
-        "en": "Format each entry with a level-2 Markdown heading `## {label} i:` followed by its body paragraph(s).",
-        "zh": "每个单元使用二级 Markdown 标题 `## 第 i {label}：` 开头，随后换行书写正文。",
+        "en": "Format each entry with a level-2 Markdown heading `## {tag}:` followed by its body paragraph(s).",
+        "zh": "每个单元使用二级 Markdown 标题 `## {tag}：` 开头，随后换行书写正文。",
     },
     {
         "format_id": "markdown_h3",
-        "en": "Format each entry with a level-3 Markdown heading `### {label} i` followed by its body paragraph(s).",
-        "zh": "每个单元使用三级 Markdown 标题 `### {label} i` 开头，随后换行书写正文。",
+        "en": "Format each entry with a level-3 Markdown heading `### {tag}` followed by its body paragraph(s).",
+        "zh": "每个单元使用三级 Markdown 标题 `### {tag}` 开头，随后换行书写正文。",
     },
     {
         "format_id": "plain_colon",
-        "en": "Start every entry on a new paragraph with `{label} i:` followed by the entry content.",
-        "zh": "每个单元另起一段，以 `{label} i：` 开头并紧接正文内容。",
+        "en": "Start every entry on a new paragraph with `{tag}:` followed by the entry content.",
+        "zh": "每个单元另起一段，以 `{tag}：` 开头并紧接正文内容。",
     },
     {
         "format_id": "hr_dash",
-        "en": "Separate consecutive entries with a `---` horizontal rule line, heading each entry as `**{label} i**`.",
-        "zh": "相邻单元之间用单独一行 `---` 分隔，每段以 `**{label} i**` 作为标题开头。",
+        "en": "Separate consecutive entries with a `---` horizontal rule line, heading each entry as `**{tag}**`.",
+        "zh": "相邻单元之间用单独一行 `---` 分隔，每段以 `**{tag}**` 作为标题开头。",
     },
     {
         "format_id": "hr_equals",
-        "en": "Separate consecutive entries with `=== {label} i ===` on its own line before the prose.",
-        "zh": "每个单元前用单独一行 `=== {label} i ===` 分隔，再换行书写正文。",
+        "en": "Separate consecutive entries with `=== {tag} ===` on its own line before the prose.",
+        "zh": "每个单元前用单独一行 `=== {tag} ===` 分隔，再换行书写正文。",
     },
 )
 
@@ -523,7 +532,7 @@ def _build_one_spec(
     else:
         fmt = rng.choice(STRUCTURED_FORMATS)
         fmt_id = fmt["format_id"]
-        fmt_inst = fmt[language].format(label=unit_label)
+        fmt_inst = fmt[language].format(tag=_unit_tag_template(unit_label, language))
 
     style_hint = rng.choice(WRITING_STYLES_EN if language == "en" else WRITING_STYLES_ZH)
     slots, start_date_str, topic_count = _sample_rule_slots(
@@ -565,32 +574,36 @@ def build_topic_seed_prompt(
     if language == "zh":
         return f"""请为领域「{domain.name_zh}」（{domain.description_zh}）生成 {count} 个高度具体、彼此完全不重复的细分写作主题种子，用于构建高质量长文写作提示词库。
 
-严格禁止出现以下题材：个人日记、餐厅每周/每日菜单、摩天大楼楼层规划、城市街区网格布局，禁止出现 `#*#` 分隔符。
+严格要求：
+1. 严禁出现以下题材：个人日记、餐厅每周/每日菜单、摩天大楼楼层规划、城市街区网格布局，禁止出现 `#*#` 分隔符。
+2. `title`、`setting`、`concepts`、`events` 中一律**不要写死任何总集数、总天数、总周数、总模块数或具体序号**（例如禁止写“12集短剧”“42天航行”“第3周”“第29章”“3号展厅”），确保每条事件都是位置无关的，后续可自由排进任意编号单元。
 
 仅返回合法 JSON 对象：
 {{
   "seeds": [
     {{
-      "title": "具体主题名称（10-25字）",
-      "setting": "具体的背景设定、目标读者或使用场景（1-2句话）",
+      "title": "具体主题名称（10-25字，不含固定集数/天数/模块数）",
+      "setting": "具体的背景设定、目标读者或使用场景（1-2句话，不含固定总单元数）",
       "concepts": ["6-8个该主题下高度具体的专业概念、子议题、条款或关键要素"],
-      "events": ["6-8个适合放在特定章节/单元中的具体事件、演练、案例、伏笔或检查项"]
+      "events": ["6-8个位置无关、适合排进任意特定单元的具体事件、演练、案例、伏笔或检查项（不带第X周/第X集/第X天前缀）"]
     }}
   ]
 }}
 """
     return f"""Generate {count} highly specific, mutually distinct scenario seeds for the domain "{domain.name_en}" ({domain.description_en}) to build a diverse long-form writing prompt corpus.
 
-Strictly avoid personal diaries, restaurant menus, skyscraper floor plans, city block grids, or `#*#` delimiters.
+Strict rules:
+1. Avoid personal diaries, restaurant menus, skyscraper floor plans, city block grids, or `#*#` delimiters.
+2. Do NOT hardcode total counts or fixed unit numbers (e.g., avoid "12-week", "42-day", "three modules", "Week 3", "Day 12", "Chapter 29") anywhere in `title`, `setting`, `concepts`, or `events`. Keep every event index-free so it can be placed cleanly at any unit index later.
 
 Return valid JSON only:
 {{
   "seeds": [
     {{
-      "title": "specific concrete topic title",
-      "setting": "1-2 sentences specifying audience, context, or operational setting",
+      "title": "specific concrete topic title without hardcoded total counts",
+      "setting": "1-2 sentences specifying audience, context, or operational setting without fixed unit counts",
       "concepts": ["6-8 concrete domain concepts, clauses, subsystems, or analytical themes"],
-      "events": ["6-8 concrete localized events, milestones, drills, plot beats, or case studies"]
+      "events": ["6-8 index-free localized events, milestones, drills, plot beats, or case studies"]
     }}
   ]
 }}
@@ -659,6 +672,10 @@ def build_natural_prompt_synthesis_request(
 ) -> str:
     domain = DOMAIN_BY_ID[spec.domain_id]
     retry_block = f"\nCORRECTION_REQUIRED:\n{retry_note}\n" if retry_note else ""
+    anonymous_rules = [
+        {k: v for k, v in slot.items() if k != "slot_id"}
+        for slot in spec.rule_slots
+    ]
     spec_payload = {
         "bucket": spec.bucket,
         "domain": domain.name_zh if spec.language == "zh" else domain.name_en,
@@ -682,23 +699,24 @@ def build_natural_prompt_synthesis_request(
         "output_format": spec.output_format_instruction,
         "required_deep_dive_topics": spec.required_topic_count if spec.bucket == "open_a1" else None,
         "start_date": spec.start_date,
-        "constraint_slots": spec.rule_slots,
+        "required_constraints": anonymous_rules,
         "writing_persona": spec.style_hint,
     }
     if spec.language == "zh":
         bucket_rule = (
             "- 本题属于【纯开放议题长文】：绝对不要硬性规定必须分成多少章/多少节，只明确目标总字数、全局风格要求，以及必须深入展开的若干具体核心议题/案例，让作者自行规划章节架构。"
             if spec.bucket == "open_a1"
-            else "- 本题必须清晰写出总单元数、每单元字数要求、指定的输出格式，以及 `constraint_slots` 中每一条约束（所有编号、起止区间、偏移起点、周期步长和日期必须 100% 原样保留，绝不能改动或遗漏任何数字）。"
+            else "- 本题必须清晰写出总单元数、每单元字数要求、指定的输出格式，以及 `required_constraints` 中每一条约束（所有编号、起止区间、偏移起点、周期步长和日期必须 100% 原样保留，绝不能改动或遗漏任何数字）。"
         )
         return f"""请根据下面的结构化规格（SPEC）和具体场景种子（SEED），编写一条自然、地道、像真实人类提出的中文长文本写作 Prompt。
 
 要求：
-1. 采用指定口吻：{spec.style_hint}。不要暴露“约束槽位”“SPEC”“SEED”等内部术语。
-2. 将 SEED 中的具体专业概念和事件自然地填进每一条约束中，使整条 Prompt 读起来像一份真实的专业委托，而不是机械填空题。
-3. {bucket_rule}
-4. 严禁出现 `#*#`、`Menu Week`、`Menu Day`、`*** finished ***` 等任何测试集特有标记。
-5. 只输出最终可直接发给大模型的用户 Prompt 正文，不要加引号、解释或前后缀说明。
+1. 采用指定口吻：{spec.style_hint}。绝对不要出现“约束槽位”“SPEC”“SEED”或任何内部代号（严禁出现 G1、G2、S1、S2、R1、P1 等字母数字编号标签）。
+2. 必须把 `required_constraints` 中的每一条约束都用 SEED 里的**具体真实业务内容/专业概念/事件**写实写透，绝不能留下空洞占位符（例如禁止写“落实某项总体要求”“做重点设计”而不说明具体要写什么）。
+3. 严禁引入与 `unit_count` 矛盾的其他总集数/总天数/超界编号。
+4. {bucket_rule}
+5. 严禁出现 `#*#`、`Menu Week`、`Menu Day`、`*** finished ***` 等任何测试集特有标记。
+6. 只输出最终可直接发给大模型的用户 Prompt 正文，不要加引号、解释或前后缀说明。
 {retry_block}
 SEED:
 {json.dumps(seed_item, ensure_ascii=False)}
@@ -710,16 +728,17 @@ SPEC:
     bucket_rule_en = (
         "- This is an OPEN-ENDED topic-driven long-writing prompt: do NOT force a fixed chapter count. State the target total word count, global style/audience requirements, and concrete deep-dive topics/cases to cover thoroughly while letting the writer organize the chapters naturally."
         if spec.bucket == "open_a1"
-        else "- Explicitly state the total unit count, per-unit word guidance, requested output format, and EVERY constraint in `constraint_slots` using the EXACT numbers, inclusive ranges, starting offsets, periodic intervals, and dates (never alter or omit any number)."
+        else "- Explicitly state the total unit count, per-unit word guidance, requested output format, and EVERY constraint in `required_constraints` using the EXACT numbers, inclusive ranges, starting offsets, periodic intervals, and dates (never alter or omit any number)."
     )
     return f"""Write one realistic, natural English user prompt for a long-form writing task based on the SEED and SPEC below.
 
 Requirements:
-1. Adopt the requested user persona: {spec.style_hint}. Never mention internal terms like "SPEC", "SEED", or "slot".
-2. Ground every global rule and localized constraint in concrete, domain-authentic details drawn from SEED so the prompt reads like a genuine human request rather than a fill-in-the-blank template.
-3. {bucket_rule_en}
-4. Strictly avoid `#*#`, `Menu Week`, `Menu Day`, or `*** finished ***`.
-5. Output ONLY the final user prompt text ready to send to an LLM (no preamble, quotes, or commentary).
+1. Adopt the requested user persona: {spec.style_hint}. Never mention internal terms like "SPEC", "SEED", "slot", or synthetic label codes (never output codes like G1, G2, S1, R1, P1).
+2. Ground EVERY constraint in `required_constraints` with concrete, domain-authentic details drawn from SEED — never leave generic placeholders.
+3. Never introduce conflicting total counts or out-of-range indices that contradict `unit_count`.
+4. {bucket_rule_en}
+5. Strictly avoid `#*#`, `Menu Week`, `Menu Day`, or `*** finished ***`.
+6. Output ONLY the final user prompt text ready to send to an LLM (no preamble, quotes, or commentary).
 {retry_block}
 SEED:
 {json.dumps(seed_item, ensure_ascii=False)}
@@ -727,6 +746,9 @@ SEED:
 SPEC:
 {json.dumps(spec_payload, ensure_ascii=False)}
 """
+
+
+_SLOT_ID_LEAK_RE = re.compile(r"(?<![A-Za-z0-9_])(?:G[12]|S[1-9]|R[12]|P[12])(?![A-Za-z0-9_])")
 
 
 def verify_prompt_fidelity(spec: PromptSpec, prompt_text: str) -> list[str]:
@@ -739,6 +761,9 @@ def verify_prompt_fidelity(spec: PromptSpec, prompt_text: str) -> list[str]:
     for bad in FORBIDDEN_PROMPT_PATTERNS:
         if bad in lower:
             errors.append(f"contains forbidden marker: {bad}")
+    leaked_ids = sorted(set(_SLOT_ID_LEAK_RE.findall(text)))
+    if leaked_ids:
+        errors.append(f"leaked internal slot IDs: {','.join(leaked_ids)}")
 
     def has_num(n: int) -> bool:
         s = str(n)
@@ -778,7 +803,7 @@ def render_natural_prompt(
     last_errors: list[str] = []
     for attempt in range(max_retries + 1):
         retry_note = (
-            f"Previous draft failed fidelity checks: {'; '.join(last_errors)}. Keep every required number intact."
+            f"Previous draft failed fidelity checks: {'; '.join(last_errors)}. Keep every required number intact and never output slot codes."
             if attempt > 0
             else ""
         )
@@ -787,7 +812,7 @@ def render_natural_prompt(
             req,
             system="You write natural, realistic, high-quality user prompts for long-form writing tasks.",
             temperature=0.7 if attempt == 0 else 0.3,
-            max_output_tokens=1_500,
+            max_output_tokens=1_800,
         )
         text = raw.strip().strip('"').strip()
         errs = verify_prompt_fidelity(spec, text)
@@ -914,20 +939,19 @@ def render_formatted_document(
         text = unit_texts.get(unit.index, "").strip()
         if not text:
             continue
-        label = contract.unit_label
-        idx = unit.index
+        tag = _unit_tag_template(contract.unit_label, language, str(unit.index))
         if output_format_id == "markdown_h2":
-            header = f"## 第 {idx} {label}：" if language == "zh" else f"## {label} {idx}:"
-            blocks.append(f"{header}\n\n{text}")
+            colon = "：" if language == "zh" else ":"
+            blocks.append(f"## {tag}{colon}\n\n{text}")
         elif output_format_id == "markdown_h3":
-            blocks.append(f"### {label} {idx}\n\n{text}")
+            blocks.append(f"### {tag}\n\n{text}")
         elif output_format_id == "plain_colon":
             colon = "：" if language == "zh" else ":"
-            blocks.append(f"{label} {idx}{colon} {text}")
+            blocks.append(f"{tag}{colon} {text}")
         elif output_format_id == "hr_dash":
-            blocks.append(f"**{label} {idx}**\n\n{text}")
+            blocks.append(f"**{tag}**\n\n{text}")
         elif output_format_id == "hr_equals":
-            blocks.append(f"=== {label} {idx} ===\n\n{text}")
+            blocks.append(f"=== {tag} ===\n\n{text}")
         else:
             blocks.append(f"## {unit.title}\n\n{text}")
 
