@@ -577,15 +577,17 @@ def build_topic_seed_prompt(
 严格要求：
 1. 严禁出现以下题材：个人日记、餐厅每周/每日菜单、摩天大楼楼层规划、城市街区网格布局，禁止出现 `#*#` 分隔符。
 2. `title`、`setting`、`concepts`、`events` 中一律**不要写死任何总集数、总天数、总周数、总模块数或具体序号**（例如禁止写“12集短剧”“42天航行”“第3周”“第29章”“3号展厅”），确保每条事件都是位置无关的，后续可自由排进任意编号单元。
+3. **题材广度与防注水**：选择内容丰富、维度多元、能够自然支撑长篇多章节展开的主题（基于扎实经典的学科/工程/行业常识），避免过于狭窄单一的冷门前沿微课题（如单一物理效应的纯公式推导），确保作者无需灌水就能写出高密度内容。
+4. **自洽设定与防事实幻觉**：涉及商业报告、法律合同、代码系统、科考任务或政策案例时，优先采用逼真的虚构组织/项目/船只名称或明确的情景假设，**不要要求引用未在题目中提供的近两年真实企业财报数字、真实统计数据或冷门文献编号**，避免诱导模型编造虚假事实。
 
 仅返回合法 JSON 对象：
 {{
   "seeds": [
     {{
       "title": "具体主题名称（10-25字，不含固定集数/天数/模块数）",
-      "setting": "具体的背景设定、目标读者或使用场景（1-2句话，不含固定总单元数）",
-      "concepts": ["6-8个该主题下高度具体的专业概念、子议题、条款或关键要素"],
-      "events": ["6-8个位置无关、适合排进任意特定单元的具体事件、演练、案例、伏笔或检查项（不带第X周/第X集/第X天前缀）"]
+      "setting": "具体的背景设定、目标读者或使用场景（1-2句话，不含固定总单元数，商业/工程/法律类可用逼真虚构主体）",
+      "concepts": ["6-8个该主题下扎实具体、广度充足的专业概念、子议题、条款或关键要素"],
+      "events": ["6-8个位置无关、适合排进任意特定单元的具体事件、演练、案例、伏笔或检查项（不带第X周/第X集/第X天前缀，不依赖未提供的真实近期财报数字）"]
     }}
   ]
 }}
@@ -595,15 +597,17 @@ def build_topic_seed_prompt(
 Strict rules:
 1. Avoid personal diaries, restaurant menus, skyscraper floor plans, city block grids, or `#*#` delimiters.
 2. Do NOT hardcode total counts or fixed unit numbers (e.g., avoid "12-week", "42-day", "three modules", "Week 3", "Day 12", "Chapter 29") anywhere in `title`, `setting`, `concepts`, or `events`. Keep every event index-free so it can be placed cleanly at any unit index later.
+3. Broad substantive scope (anti-padding): pick rich, multi-faceted topics grounded in well-established engineering, scientific, historical, or practical knowledge that can genuinely sustain long multi-chapter writing without repetition or filler (avoid ultra-narrow PhD micro-topics).
+4. Self-contained & anti-hallucination: for business, legal, engineering, expedition, or policy scenarios, use realistic fictional organizations, vessels, or clearly illustrative assumptions instead of demanding unprovided recent real-world corporate financial figures (e.g., no "2025 Q2 utilization numbers") or obscure archival citations.
 
 Return valid JSON only:
 {{
   "seeds": [
     {{
       "title": "specific concrete topic title without hardcoded total counts",
-      "setting": "1-2 sentences specifying audience, context, or operational setting without fixed unit counts",
-      "concepts": ["6-8 concrete domain concepts, clauses, subsystems, or analytical themes"],
-      "events": ["6-8 index-free localized events, milestones, drills, plot beats, or case studies"]
+      "setting": "1-2 sentences specifying audience, context, or realistic fictional/classic setting without fixed unit counts",
+      "concepts": ["6-8 rich, well-established domain concepts, clauses, subsystems, or analytical themes"],
+      "events": ["6-8 index-free localized events, milestones, drills, plot beats, or case studies that do not require unprovided real-world statistics"]
     }}
   ]
 }}
@@ -713,7 +717,7 @@ def build_natural_prompt_synthesis_request(
 要求：
 1. 采用指定口吻：{spec.style_hint}。绝对不要出现“约束槽位”“SPEC”“SEED”或任何内部代号（严禁出现 G1、G2、S1、S2、R1、P1 等字母数字编号标签）。
 2. 必须把 `required_constraints` 中的每一条约束都用 SEED 里的**具体真实业务内容/专业概念/事件**写实写透，绝不能留下空洞占位符（例如禁止写“落实某项总体要求”“做重点设计”而不说明具体要写什么）。
-3. 严禁引入与 `unit_count` 矛盾的其他总集数/总天数/超界编号。
+3. 严禁引入与 `unit_count` 矛盾的其他总集数/总天数/超界编号；严禁要求作者编造或查找未在题目中给出的真实近两年企业财报数据或冷门文献编号（如需量化演示，请明确要求使用标明前提的推演/示意数值）。
 4. {bucket_rule}
 5. 严禁出现 `#*#`、`Menu Week`、`Menu Day`、`*** finished ***` 等任何测试集特有标记。
 6. 只输出最终可直接发给大模型的用户 Prompt 正文，不要加引号、解释或前后缀说明。
@@ -735,7 +739,7 @@ SPEC:
 Requirements:
 1. Adopt the requested user persona: {spec.style_hint}. Never mention internal terms like "SPEC", "SEED", "slot", or synthetic label codes (never output codes like G1, G2, S1, R1, P1).
 2. Ground EVERY constraint in `required_constraints` with concrete, domain-authentic details drawn from SEED — never leave generic placeholders.
-3. Never introduce conflicting total counts or out-of-range indices that contradict `unit_count`.
+3. Never introduce conflicting total counts or out-of-range indices that contradict `unit_count`; never ask the writer to cite unprovided recent real-world corporate stats or obscure citations (when quantitative illustration is helpful, ask for clearly labeled illustrative assumptions).
 4. {bucket_rule_en}
 5. Strictly avoid `#*#`, `Menu Week`, `Menu Day`, or `*** finished ***`.
 6. Output ONLY the final user prompt text ready to send to an LLM (no preamble, quotes, or commentary).
