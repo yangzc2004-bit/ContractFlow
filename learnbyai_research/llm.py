@@ -620,8 +620,12 @@ def extract_responses_text(data: dict[str, Any]) -> str:
     for item in data.get("output", []):
         if not isinstance(item, dict):
             continue
+        if item.get("type") == "reasoning":
+            continue
         for content in item.get("content", []):
             if not isinstance(content, dict):
+                continue
+            if content.get("type") in {"reasoning_text", "summary_text"}:
                 continue
             text = content.get("text")
             if isinstance(text, str):
