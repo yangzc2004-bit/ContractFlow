@@ -6,18 +6,20 @@ import re
 from collections import Counter
 from pathlib import Path
 
-from learnbyai_research.contractflow_v2 import FlowConfig
+from learnbyai_research.contractflow_v2 import DocumentContract, FlowConfig, UnitContract
 from learnbyai_research.llm import extract_responses_text
 from learnbyai_research.posttrain_data import (
     DOMAINS,
     DOMAIN_BY_ID,
     check_prompt_leakage,
     deduplicate_prompts,
+    evaluate_sample_quality,
     export_canary_review_markdown,
     export_prompts_preview_markdown,
     export_sft_datasets,
     generate_topic_seeds,
     load_leakage_references,
+    render_formatted_document,
     render_natural_prompt,
     sample_prompt_specs,
     synthesize_posttrain_sample,
@@ -301,3 +303,168 @@ def test_posttrain_cli_scripts_parse_arguments() -> None:
         ["--prompts-jsonl", "runs/canary/prompts.jsonl", "--out-dir", "runs/canary_sft", "--workers", "4"]
     )
     assert s_args.workers == 4 and s_args.length_retry_ratio == 0.7
+
+
+def test_render_formatted_document_strips_duplicate_headings_and_separators() -> None:
+    contract = DocumentContract(
+        global_brief="三集连续剧大纲。",
+        global_invariants=[],
+        unit_label="集",
+        total_units=3,
+        rules=[],
+        units=[
+            UnitContract(index=1, title="第 1 集", min_words=50, max_words=100),
+            UnitContract(index=2, title="第 2 集", min_words=50, max_words=100),
+            UnitContract(index=3, title="第 3 集", min_words=50, max_words=100),
+        ],
+    )
+    rendered_hr = render_formatted_document(
+        contract,
+        {
+            1: "---\n**第 1 集**\n\n---\n暴雨夜里的信号塔突然失联。\n---",
+            2: "**第 2 集：** 紧接上一集的线索展开调查。\n===",
+            3: "第 3 集讲述了团队在黎明前完成切换的过程。",
+        },
+        output_format_id="hr_dash",
+        language="zh",
+    )
+    assert rendered_hr.count("**第 1 集**") == 1
+    assert rendered_hr.count("**第 2 集**") == 1
+    assert rendered_hr.count("**第 3 集**") == 1
+    assert "\n\n---\n\n---" not in rendered_hr
+    assert "暴雨夜里的信号塔突然失联。" in rendered_hr
+    # Inline bold prefix must strip ONLY the prefix, preserving prose on the same line
+    assert "紧接上一集的线索展开调查。" in rendered_hr
+    # Natural prose starting with "第 3 集讲述了..." (no colon/heading syntax) must be preserved
+    assert "第 3 集讲述了团队在黎明前完成切换的过程。" in rendered_hr
+
+    rendered_h2 = render_formatted_document(
+        contract,
+        {
+            1: "## 第 1 集：序幕\n第 1 集：这是正式正文内容。",
+        },
+        output_format_id="markdown_h2",
+        language="zh",
+    )
+    assert rendered_h2 == "## 第 1 集：\n\n这是正式正文内容。"
+
+
+def test_open_a1_calibrates_unit_word_budgets_to_target_length(tmp_path) -> None:
+    class MockOpenA1LLM:
+        model = "qwen3.5-9b-mock"
+
+        def complete(self, prompt: str, **kwargs) -> str:
+            if "CONTRACTFLOW_SPARSE_CONTRACT_JSON" in prompt:
+                # Stage-1 chooses 6 chapters for a 12,000-word target (instead of spec's initial 18)
+                return json.dumps(
+                    {
+                        "global_brief": "Comprehensive six-chapter policy study.",
+                        "total_units": 6,
+                        "unit_label": "Chapter",
+                        "unit_titles": {str(i): f"Chapter {i}: Section {i}" for i in range(1, 7)},
+                        "global_invariants": ["Maintain formal analytical tone."],
+                        "rules": [],
+                    }
+                )
+            if "CONTRACTFLOW_DRAFT_UNITS" in prompt:
+                match = re.search(r"Write ONLY the requested units: (\[[^\]]+\])", prompt)
+                indices = json.loads(match.group(1))
+                return "\n".join(
+                    f"<<<UNIT {idx}>>>\n"
+                    + " ".join(f"ch{idx}w{k}" for k in range(2000))
+                    + f"\n<<<END UNIT {idx}>>>"
+                    for idx in indices
+                )
+            if "CONTRACTFLOW_DRAFT_SINGLE_UNIT" in prompt:
+                match = re.search(r"Write ONLY unit (\d+)", prompt)
+                idx = int(match.group(1)) if match else 1
+                return " ".join(f"ch{idx}w{k}" for k in range(2000))
+            return "{}"
+
+        def completion_metadata(self) -> dict:
+            return {"finish_reason": "stop"}
+
+        def completion_history(self) -> list[dict]:
+            return []
+
+    prompt_record = {
+        "spec_id": "test_open_a1_12k",
+        "prompt": "Write a comprehensive 12,000-word policy study on maritime port resilience.",
+        "spec": {
+            "spec_id": "test_open_a1_12k",
+            "bucket": "open_a1",
+            "domain_id": "A2_policy_report",
+            "language": "en",
+            "length_tier": "16K",
+            "target_length": 12000,
+            "unit_count": 18,
+            "unit_label": "Chapter",
+            "min_unit_words": 450,
+            "max_unit_words": 650,
+            "output_format_id": "markdown_open",
+        },
+        "seed_item": {"title": "Port Resilience Study"},
+    }
+    sample = synthesize_posttrain_sample(
+        prompt_record,
+        MockOpenA1LLM(),
+        config=FlowConfig(batch_size=3, use_contracts=True, use_review_repair=False),
+        checkpoint_path=tmp_path / "open_a1_ckpt.json",
+    )
+    compiled_units = sample["contract_v2"]["units"]
+    assert len(compiled_units) == 6
+    # 12000 / 6 = 2000 -> cal_min = 1760, cal_max = 2300
+    assert compiled_units[0]["min_words"] == 1760
+    assert compiled_units[0]["max_words"] == 2300
+    assert sample["quality"]["passed"] is True
+
+
+def test_evaluate_sample_quality_6_gates_language_and_hygiene() -> None:
+    zh_record = {
+        "spec": {
+            "language": "zh",
+            "target_length": 100,
+        }
+    }
+    base_result = {
+        "contract": {"total_units": 2, "units": [{"index": 1}, {"index": 2}]},
+        "units": [{"index": 1, "text": "a"}, {"index": 2, "text": "b"}],
+        "metadata": {"review_results": [], "repair_records": []},
+    }
+
+    # 1) ZH prompt with English output must FAIL Gate 5
+    en_only = " ".join(f"englishword{i}" for i in range(100))
+    q_zh_mismatch = evaluate_sample_quality(zh_record, {**base_result, "final_text": en_only})
+    assert q_zh_mismatch["passed"] is False
+    assert any(r.startswith("language_mismatch_zh") for r in q_zh_mismatch["reasons"])
+
+    # 2) EN prompt with Chinese output must FAIL Gate 5
+    en_record = {"spec": {"language": "en", "target_length": 100}}
+    zh_clean = (
+        "## 第一章：引言\n\n"
+        "近年来分布式共识协议与容错存储架构在跨区域云基础设施中发挥着核心作用，"
+        "本章节围绕状态机复制、日志压缩、租约读优化与网络分区恢复机制展开系统阐述，"
+        "结合实际工程故障演练与可观测性指标给出清晰落地规范。"
+    )
+    q_en_mismatch = evaluate_sample_quality(en_record, {**base_result, "final_text": zh_clean})
+    assert q_en_mismatch["passed"] is False
+    assert any(r.startswith("language_mismatch_en") for r in q_en_mismatch["reasons"])
+
+    # 3) Clean Chinese output passes all 6 gates
+    q_zh_pass = evaluate_sample_quality(zh_record, {**base_result, "final_text": zh_clean})
+    assert q_zh_pass["passed"] is True
+    assert q_zh_pass["cjk_ratio"] >= 0.45
+    assert q_zh_pass["format_hygiene_issues"] == []
+
+    # 4) Duplicate consecutive headings, double --- separators, and leftover tags fail Gate 6
+    dirty_text = (
+        "**第 1 集**\n\n**第 1 集**\n\n"
+        + zh_clean
+        + "\n\n---\n\n---\n\n<<<UNIT 2>>>"
+    )
+    q_dirty = evaluate_sample_quality(zh_record, {**base_result, "final_text": dirty_text})
+    assert q_dirty["passed"] is False
+    assert "duplicate_consecutive_headings" in q_dirty["format_hygiene_issues"]
+    assert "duplicate_hr_separators" in q_dirty["format_hygiene_issues"]
+    assert "leftover_unit_tags" in q_dirty["format_hygiene_issues"]
+

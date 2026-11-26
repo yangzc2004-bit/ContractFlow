@@ -10,7 +10,10 @@ from learnbyai_research.contractflow_v2 import (
     DocumentContract,
     FlowConfig,
     UnitContract,
+    build_singleton_draft_prompt,
+    build_sparse_contract_prompt,
     build_unit_repair_prompt,
+    build_window_draft_prompt,
     build_window_review_prompt,
     compile_sparse_contract,
     draft_token_budget,
@@ -21,6 +24,7 @@ from learnbyai_research.contractflow_v2 import (
     repair_token_budget,
     review_token_budget,
     run_contractflow,
+    word_count,
 )
 from learnbyai_research.longgenbench import task_from_dataset_item
 from learnbyai_research.longgenbench_official_eval import (
@@ -681,5 +685,61 @@ def test_run_longgenbench_shared_contract_cache(tmp_path) -> None:
     assert hit3 is True
     assert c3.to_dict() == c1.to_dict()
     assert hist3 == hist1
+
+
+def test_multilingual_word_count_and_language_agnostic_prompts() -> None:
+    # English, Chinese, mixed, Japanese (Kanji+Kana), Korean (Hangul), Spanish/French accented Latin
+    assert word_count("Hello world, it's 2026!") == 4
+    assert word_count("中文测试共八个字。") == 8
+    assert word_count("使用 Saga 和幂等设计") == 8
+    assert word_count("東京のシステム設計") == 9
+    assert word_count("한국어 테스트") == 6
+    assert word_count("España y acción: naïve café") == 5
+
+    compile_prompt = build_sparse_contract_prompt("请撰写一份分布式存储设计文档。")
+    assert "strictly in the same language as USER_REQUEST" in compile_prompt
+    assert "proportional to the requested document length" in compile_prompt
+
+    contract = DocumentContract(
+        global_brief="关于高可用分布式存储系统的中文技术手册。",
+        global_invariants=["保持术语一致。"],
+        unit_label="章",
+        total_units=2,
+        rules=[],
+        units=[
+            UnitContract(index=1, title="第 1 章：架构概览", min_words=500, max_words=800, obligations=["介绍 Raft"]),
+            UnitContract(index=2, title="第 2 章：故障恢复", min_words=500, max_words=800, obligations=[]),
+        ],
+    )
+    window_prompt = build_window_draft_prompt(contract, contract.units, rolling_state="")
+    assert "strictly in the same language as GLOBAL_BRIEF" in window_prompt
+    assert "characters for non-space-delimited scripts" in window_prompt
+    assert "boilerplate" in window_prompt
+    assert "horizontal rules" in window_prompt
+
+    single_prompt = build_singleton_draft_prompt(contract, contract.units[0], rolling_state="")
+    assert "strictly in the same language as GLOBAL_BRIEF" in single_prompt
+    assert "characters for non-space-delimited scripts" in single_prompt
+    assert "horizontal rules" in single_prompt
+
+    repair_contract = build_unit_repair_prompt(
+        contract,
+        [contract.units[0]],
+        {1: "初稿内容"},
+        {1: {"passed": False, "issues": ["缺少 Raft 说明"]}},
+    )
+    assert "strictly in the same language as GLOBAL_BRIEF" in repair_contract
+    assert "characters for non-space-delimited scripts" in repair_contract
+
+    repair_raw = build_unit_repair_prompt(
+        contract,
+        [contract.units[0]],
+        {1: "初稿内容"},
+        {1: {"passed": False, "issues": ["缺少 Raft 说明"]}},
+        use_contracts=False,
+    )
+    assert "strictly in the same language as USER_REQUEST" in repair_raw
+    assert "characters for non-space-delimited scripts" in repair_raw
+
 
 

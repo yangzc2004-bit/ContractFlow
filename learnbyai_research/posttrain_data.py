@@ -14,6 +14,7 @@ from typing import Any, Literal
 from .contractflow_v2 import (
     DocumentContract,
     FlowConfig,
+    compile_sparse_contract,
     render_markdown_document,
     run_contractflow,
     word_count,
@@ -716,7 +717,7 @@ def build_natural_prompt_synthesis_request(
 
 要求：
 1. 采用指定口吻：{spec.style_hint}。绝对不要出现“约束槽位”“SPEC”“SEED”或任何内部代号（严禁出现 G1、G2、S1、S2、R1、P1 等字母数字编号标签）。
-2. 必须把 `required_constraints` 中的每一条约束都用 SEED 里的**具体真实业务内容/专业概念/事件**写实写透，绝不能留下空洞占位符（例如禁止写“落实某项总体要求”“做重点设计”而不说明具体要写什么）。
+2. 必须把 `required_constraints` 中的每一条约束都用 SEED 里的**具体真实业务内容/专业概念/事件**写实写透，绝不能留下空洞占位符（例如禁止写“落实某项总体要求”“做重点设计”而不说明具体要写什么）。对于 `scope="all"` 的全局约束，应侧重整体视角、专业体例或原则一致性，避免要求所有上百个单元逐字重复同一段固定检查清单。
 3. 严禁引入与 `unit_count` 矛盾的其他总集数/总天数/超界编号；严禁要求作者编造或查找未在题目中给出的真实近两年企业财报数据或冷门文献编号（如需量化演示，请明确要求使用标明前提的推演/示意数值）。
 4. {bucket_rule}
 5. 严禁出现 `#*#`、`Menu Week`、`Menu Day`、`*** finished ***` 等任何测试集特有标记。
@@ -738,7 +739,7 @@ SPEC:
 
 Requirements:
 1. Adopt the requested user persona: {spec.style_hint}. Never mention internal terms like "SPEC", "SEED", "slot", or synthetic label codes (never output codes like G1, G2, S1, R1, P1).
-2. Ground EVERY constraint in `required_constraints` with concrete, domain-authentic details drawn from SEED — never leave generic placeholders.
+2. Ground EVERY constraint in `required_constraints` with concrete, domain-authentic details drawn from SEED — never leave generic placeholders. Keep `scope="all"` global rules focused on consistent voice, perspective, or structural standards rather than forcing a long verbatim checklist into every single unit.
 3. Never introduce conflicting total counts or out-of-range indices that contradict `unit_count`; never ask the writer to cite unprovided recent real-world corporate stats or obscure citations (when quantitative illustration is helpful, ask for clearly labeled illustrative assumptions).
 4. {bucket_rule_en}
 5. Strictly avoid `#*#`, `Menu Week`, `Menu Day`, or `*** finished ***`.
@@ -925,8 +926,92 @@ def deduplicate_prompts(
 
 
 # ---------------------------------------------------------------------------
-# ContractFlow v2 Self-Bootstrapping Synthesis & 4-Gate Quality Filtering
+# ContractFlow v2 Self-Bootstrapping Synthesis & 6-Gate Quality Filtering
 # ---------------------------------------------------------------------------
+
+def _sanitize_unit_body(
+    text: str,
+    *,
+    tag: str,
+    unit_label: str,
+    index: int,
+    title: str,
+) -> str:
+    """Strip duplicate unit headings and stray horizontal rules before outer formatting."""
+    cleaned = text.strip()
+    if not cleaned:
+        return ""
+
+    # Strip leading/trailing standalone separator lines (---, ***, ===)
+    sep_line_re = re.compile(r"^\s*(?:---+|\*\*\*+|===+)\s*$")
+    lines = cleaned.splitlines()
+    while lines and (not lines[0].strip() or sep_line_re.match(lines[0])):
+        lines.pop(0)
+    while lines and (not lines[-1].strip() or sep_line_re.match(lines[-1])):
+        lines.pop()
+    cleaned = "\n".join(lines).strip()
+
+    esc_label = re.escape(unit_label.strip()) if unit_label.strip() else ""
+    esc_tag = re.escape(tag.strip()) if tag.strip() else ""
+    esc_title = re.escape(title.strip()) if title.strip() else ""
+    idx_alts: list[str] = []
+    if esc_tag:
+        idx_alts.append(esc_tag)
+    if esc_label:
+        idx_alts.append(rf"第\s*{index}\s*{esc_label}")
+        idx_alts.append(rf"{esc_label}\s*{index}")
+    if esc_title:
+        idx_alts.append(esc_title)
+    if not idx_alts:
+        return cleaned
+
+    idx_pat = "(?:" + "|".join(idx_alts) + ")"
+    heading_patterns = [
+        # Full-line markdown ATX heading: ## Tag ...
+        re.compile(
+            rf"^#{{1,4}}\s*{idx_pat}(?:[\s:：—–-][^\n]*)?\s*(?:\n+|$)",
+            flags=re.IGNORECASE,
+        ),
+        # Standalone bold heading line: **Tag** or **Tag: Subtitle**
+        re.compile(
+            rf"^\*\*\s*{idx_pat}(?:[\s:：—–-][^*\n]*)?\*\*\s*(?:\n+|$)",
+            flags=re.IGNORECASE,
+        ),
+        # Standalone equals heading line: === Tag ===
+        re.compile(
+            rf"^===+\s*{idx_pat}(?:[\s:：—–-][^=\n]*)?===+\s*(?:\n+|$)",
+            flags=re.IGNORECASE,
+        ),
+        # Inline bold prefix on the same line as prose: **Tag:** prose...
+        re.compile(
+            rf"^\*\*\s*{idx_pat}\s*[:：]?\s*\*\*\s*[:：]?\s*",
+            flags=re.IGNORECASE,
+        ),
+        # Plain inline tag with colon: Tag: prose...
+        re.compile(
+            rf"^{idx_pat}\s*[:：]\s*",
+            flags=re.IGNORECASE,
+        ),
+    ]
+    for _ in range(3):
+        changed = False
+        for pat in heading_patterns:
+            next_cleaned = pat.sub("", cleaned, count=1).strip()
+            if next_cleaned != cleaned:
+                cleaned = next_cleaned
+                changed = True
+                break
+        if not changed:
+            break
+
+    # Re-trim any separator line exposed right after stripping a leading heading
+    lines = cleaned.splitlines()
+    while lines and (not lines[0].strip() or sep_line_re.match(lines[0])):
+        lines.pop(0)
+    while lines and (not lines[-1].strip() or sep_line_re.match(lines[-1])):
+        lines.pop()
+    return "\n".join(lines).strip()
+
 
 def render_formatted_document(
     contract: DocumentContract,
@@ -936,14 +1021,34 @@ def render_formatted_document(
     language: LanguageCode,
 ) -> str:
     if output_format_id == "markdown_open":
-        return render_markdown_document(contract, unit_texts)
+        cleaned_texts = {
+            unit.index: _sanitize_unit_body(
+                unit_texts.get(unit.index, ""),
+                tag=_unit_tag_template(contract.unit_label, language, str(unit.index)),
+                unit_label=contract.unit_label,
+                index=unit.index,
+                title=unit.title,
+            )
+            for unit in contract.units
+            if unit.index in unit_texts
+        }
+        return render_markdown_document(contract, cleaned_texts)
 
     blocks: list[str] = []
     for unit in contract.units:
-        text = unit_texts.get(unit.index, "").strip()
-        if not text:
+        raw_text = unit_texts.get(unit.index, "").strip()
+        if not raw_text:
             continue
         tag = _unit_tag_template(contract.unit_label, language, str(unit.index))
+        text = _sanitize_unit_body(
+            raw_text,
+            tag=tag,
+            unit_label=contract.unit_label,
+            index=unit.index,
+            title=unit.title,
+        )
+        if not text:
+            continue
         if output_format_id == "markdown_h2":
             colon = "：" if language == "zh" else ":"
             blocks.append(f"## {tag}{colon}\n\n{text}")
@@ -977,20 +1082,47 @@ def synthesize_posttrain_sample(
     bucket: BucketKind = spec["bucket"]
     language: LanguageCode = spec["language"]
     fmt_id = str(spec.get("output_format_id", "markdown_open"))
+    cfg = config or FlowConfig()
 
     total_units = None if bucket == "open_a1" else int(spec["unit_count"])
     unit_label = None if bucket == "open_a1" else str(spec["unit_label"])
     min_words = int(spec["min_unit_words"])
     max_words = int(spec["max_unit_words"])
 
+    precompiled_contract: DocumentContract | None = None
+    ckpt_exists = checkpoint_path is not None and Path(checkpoint_path).exists()
+    if bucket == "open_a1" and not ckpt_exists:
+        # Let Stage-1 choose the natural chapter outline, then calibrate per-chapter word budgets to hit target_length.
+        compiled = compile_sparse_contract(
+            prompt,
+            llm,
+            total_units=None,
+            unit_label=None,
+            min_words=min_words,
+            max_words=max_words,
+            max_output_tokens=cfg.plan_max_output_tokens,
+            retry_cap_tokens=cfg.plan_retry_cap_tokens,
+        )
+        target_length = max(1, int(spec.get("target_length", 1)))
+        actual_units = max(1, len(compiled.units))
+        lower_floor = min(max(1, min_words), 120)
+        calibrated_avg = max(lower_floor, min(2_600, int(round(target_length / actual_units))))
+        cal_min = max(1, int(round(calibrated_avg * 0.88)))
+        cal_max = max(cal_min + 10, int(round(calibrated_avg * 1.15)))
+        for unit in compiled.units:
+            unit.min_words = cal_min
+            unit.max_words = cal_max
+        precompiled_contract = compiled
+
     result = run_contractflow(
         prompt,
         llm,
-        config=config or FlowConfig(),
+        config=cfg,
         total_units=total_units,
         unit_label=unit_label,
         min_words=min_words,
         max_words=max_words,
+        precompiled_contract=precompiled_contract,
         checkpoint_path=checkpoint_path,
         renderer=lambda contract, texts: render_formatted_document(
             contract,
@@ -1032,6 +1164,20 @@ def _repetition_score(text: str) -> float:
     return round(max(scores, default=0.0), 4)
 
 
+def _format_hygiene_issues(text: str) -> list[str]:
+    issues: list[str] = []
+    if "<<<UNIT" in text or "<<<END UNIT" in text:
+        issues.append("leftover_unit_tags")
+    if re.search(r"(?m)^---\s*\n(?:\s*\n)*---\s*$", text):
+        issues.append("duplicate_hr_separators")
+    if re.search(
+        r"(?m)^(#{2,3}\s+[^\n]+|\*\*[^*\n]+\*\*|===\s+[^\n]+\s+===)\s*\n(?:\s*\n)*\1\s*$",
+        text,
+    ):
+        issues.append("duplicate_consecutive_headings")
+    return issues
+
+
 def evaluate_sample_quality(
     prompt_record: dict[str, Any],
     result: dict[str, Any],
@@ -1040,9 +1186,12 @@ def evaluate_sample_quality(
     max_length_ratio: float = 1.40,
     min_review_pass_rate: float = 0.85,
     max_repetition: float = 0.12,
+    min_zh_cjk_ratio: float = 0.45,
+    max_en_cjk_ratio: float = 0.05,
 ) -> dict[str, Any]:
-    """4-gate automatic quality filter for ContractFlow v2 self-bootstrapped samples."""
+    """6-gate automatic quality filter for ContractFlow v2 self-bootstrapped samples."""
     spec = prompt_record["spec"]
+    language = str(spec.get("language", "en")).lower()
     contract = result.get("contract", {})
     total_units = int(contract.get("total_units") or len(contract.get("units", [])) or 0)
     present_units = len(result.get("units", []))
@@ -1052,6 +1201,9 @@ def evaluate_sample_quality(
     actual_len = word_count(final_text)
     target_len = max(1, int(spec.get("target_length", 1)))
     length_ratio = round(actual_len / target_len, 4)
+
+    cjk_chars = len(re.findall(r"[\u4e00-\u9fff]", final_text))
+    cjk_ratio = round(cjk_chars / max(1, actual_len), 4)
 
     meta = result.get("metadata", {})
     reviews = list(meta.get("review_results", []))
@@ -1067,6 +1219,7 @@ def evaluate_sample_quality(
         review_pass_rate = 1.0
 
     rep_score = _repetition_score(final_text)
+    hygiene_issues = _format_hygiene_issues(final_text)
 
     reasons: list[str] = []
     if cr < 1.0:
@@ -1077,6 +1230,11 @@ def evaluate_sample_quality(
         reasons.append(f"low_review_pass_rate:{review_pass_rate:.2f}")
     if rep_score > max_repetition:
         reasons.append(f"high_repetition:{rep_score:.3f}")
+    if language == "zh" and cjk_ratio < min_zh_cjk_ratio:
+        reasons.append(f"language_mismatch_zh:cjk_ratio={cjk_ratio:.3f}")
+    if language == "en" and cjk_ratio > max_en_cjk_ratio:
+        reasons.append(f"language_mismatch_en:cjk_ratio={cjk_ratio:.3f}")
+    reasons.extend(hygiene_issues)
 
     return {
         "passed": len(reasons) == 0,
@@ -1085,9 +1243,11 @@ def evaluate_sample_quality(
         "actual_length": actual_len,
         "target_length": target_len,
         "length_ratio": length_ratio,
+        "cjk_ratio": cjk_ratio,
         "review_count": len(reviews),
         "review_pass_rate": review_pass_rate,
         "repetition_score": rep_score,
+        "format_hygiene_issues": hygiene_issues,
     }
 
 

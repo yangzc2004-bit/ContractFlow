@@ -240,6 +240,8 @@ Rules for accuracy:
 - Double-check that every integer field ("index", "start", "end", "step") matches the exact numbers in your "derivation" and "obligation".
 - If a rule spans positions separated by a constant stride (e.g., jumping by a fixed offset along a schedule or 2D grid), use scope "every" with exact "start", "end", and "step".
 - Keep each "obligation" concrete, faithful to USER_REQUEST, and free of invented details.
+- Write "global_brief", "unit_titles", "global_invariants", and every "obligation" strictly in the same language as USER_REQUEST.
+- When "total_units" is not explicitly fixed in USER_REQUEST, choose a natural number of chapters/sections proportional to the requested document length (roughly 500-1,200 words or CJK characters per unit).
 - Leave "unit_titles" empty ({{}}) unless specific chapter/section titles are requested or helpful for open-ended writing.
 {unit_hint}
 USER_REQUEST:
@@ -466,9 +468,11 @@ ROLLING_STATE (recent context for continuity):
 
 REQUIREMENTS:
 - Output every requested index exactly once.
-- Each unit must contain {min_w} to {max_w} words of final reader-facing prose.
+- Write all prose strictly in the same language as GLOBAL_BRIEF.
+- Each unit must contain {min_w} to {max_w} words (or characters for non-space-delimited scripts such as CJK) of final reader-facing prose.
 - Fulfill every listed obligation naturally in its assigned unit.
-- Do not include wrapper markdown headings or benchmark markers inside the prose.
+- Vary phrasing, structure, and concrete details across units; do not copy boilerplate sentences verbatim from previous units.
+- Do not include wrapper markdown headings, horizontal rules (`---` / `===`), or benchmark markers inside the prose.
 - Wrap each unit in exact tags, replacing {example_idx} with each requested index:
 
 <<<UNIT {example_idx}>>>
@@ -516,8 +520,10 @@ UNIT_OBLIGATIONS (must be clearly included):
 {obligations_block}
 {note_section}
 REQUIREMENTS:
-- Write {unit.min_words} to {unit.max_words} words of final reader-facing prose.
-- Return ONLY the prose for unit {unit.index}. Do NOT add wrapper tags, headings, or commentary.
+- Write strictly in the same language as GLOBAL_BRIEF.
+- Write {unit.min_words} to {unit.max_words} words (or characters for non-space-delimited scripts such as CJK) of final reader-facing prose.
+- Vary phrasing and concrete details; do not copy boilerplate sentences verbatim from previous units.
+- Return ONLY the prose for unit {unit.index}. Do NOT add wrapper tags, headings, horizontal rules, or commentary.
 """
 
 
@@ -616,9 +622,10 @@ DIAGNOSED_ISSUES:
 {json.dumps(issue, ensure_ascii=False)}
 
 REQUIREMENTS:
-- Write {unit.min_words} to {unit.max_words} words of final reader-facing prose.
+- Write strictly in the same language as USER_REQUEST.
+- Write {unit.min_words} to {unit.max_words} words (or characters for non-space-delimited scripts such as CJK) of final reader-facing prose.
 - Resolve every issue in DIAGNOSED_ISSUES and clearly satisfy all requirements in USER_REQUEST that apply to unit {unit.index}.
-- Return ONLY the revised prose for unit {unit.index}. Do NOT add wrapper tags, headings, or commentary.
+- Return ONLY the revised prose for unit {unit.index}. Do NOT add wrapper tags, headings, horizontal rules, or commentary.
 """
         return f"""CONTRACTFLOW_REPAIR_SINGLE_UNIT
 
@@ -637,9 +644,10 @@ DIAGNOSED_ISSUES:
 {json.dumps(issue, ensure_ascii=False)}
 
 REQUIREMENTS:
-- Write {unit.min_words} to {unit.max_words} words of final reader-facing prose.
+- Write strictly in the same language as GLOBAL_BRIEF.
+- Write {unit.min_words} to {unit.max_words} words (or characters for non-space-delimited scripts such as CJK) of final reader-facing prose.
 - Treat UNIT_OBLIGATIONS as authoritative: clearly satisfy every listed obligation and NEVER remove or omit any listed obligation even if DIAGNOSED_ISSUES questions it.
-- Return ONLY the revised prose for unit {unit.index}. Do NOT add wrapper tags, headings, or commentary.
+- Return ONLY the revised prose for unit {unit.index}. Do NOT add wrapper tags, headings, horizontal rules, or commentary.
 """
 
     indices = [unit.index for unit in targets]
@@ -659,7 +667,7 @@ REQUIREMENTS:
         return f"""CONTRACTFLOW_REPAIR_UNITS
 
 Rewrite ONLY units {indices} to resolve every listed issue and satisfy all requirements in USER_REQUEST that apply to those units.
-Each revised unit must contain {min_w} to {max_w} words of reader-facing prose.
+Write strictly in the same language as USER_REQUEST. Each revised unit must contain {min_w} to {max_w} words (or characters for non-space-delimited scripts such as CJK) of reader-facing prose.
 
 Use exact tags:
 <<<UNIT {example_idx}>>>
@@ -687,7 +695,7 @@ FAILING_UNITS_JSON:
 
 Rewrite ONLY units {indices} to resolve every listed issue and include every listed obligation.
 Treat each unit's `obligations` list as authoritative: clearly satisfy every listed obligation and NEVER remove or omit any listed obligation even if `issues` questions it.
-Each revised unit must contain {min_w} to {max_w} words of reader-facing prose.
+Write strictly in the same language as GLOBAL_BRIEF. Each revised unit must contain {min_w} to {max_w} words (or characters for non-space-delimited scripts such as CJK) of reader-facing prose.
 
 Use exact tags:
 <<<UNIT {example_idx}>>>
@@ -1258,10 +1266,17 @@ def v2_system_name(use_contracts: bool, use_review_repair: bool) -> str:
     return "v2_neither"
 
 
+_CJK_SCRIPT_RE = re.compile(r"[\u4e00-\u9fff\u3040-\u30ff\uac00-\ud7af]")
+_UNICODE_WORD_RE = re.compile(
+    r"[^\W_\u4e00-\u9fff\u3040-\u30ff\uac00-\ud7af]+"
+    r"(?:['-][^\W_\u4e00-\u9fff\u3040-\u30ff\uac00-\ud7af]+)*"
+)
+
+
 def word_count(text: str) -> int:
-    cjk = len(re.findall(r"[\u4e00-\u9fff]", text))
-    latin = len(re.findall(r"\b[A-Za-z0-9][A-Za-z0-9'-]*\b", text))
-    return cjk + latin
+    cjk = len(_CJK_SCRIPT_RE.findall(text))
+    words = len(_UNICODE_WORD_RE.findall(text))
+    return cjk + words
 
 
 def _length_retry_floor(min_words: int, ratio: float) -> int:
