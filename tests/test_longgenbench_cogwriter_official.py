@@ -96,6 +96,8 @@ def test_bounded_recovery_caps_all_four_length_refinement_loops() -> None:
 
 
 def test_official_plan_cardinality_uses_the_adapted_task_type() -> None:
+    assert official_plan_key("Week") == "weekly_plan"
+    assert official_plan_key("Menu Week") == "weekly_plan"
     assert official_plan_key("Day") == "weekly_plan"
     assert official_plan_key("Menu Day") == "weekly_plan"
     assert official_plan_entry_count(
@@ -103,6 +105,70 @@ def test_official_plan_cardinality_uses_the_adapted_task_type() -> None:
         "Block",
     ) == 2
     assert official_plan_entry_count({"floor_plan": "not-a-list"}, "Floor") == 0
+
+
+def test_resolve_official_parameter_profile_leaves_16k_native_types_unchanged() -> None:
+    import importlib.util
+    from learnbyai_research.longgenbench import task_from_dataset_item
+    from learnbyai_research.longgenbench_cogwriter_official import (
+        resolve_official_parameter_profile,
+    )
+
+    for seg_type, count in (("Week", 52), ("Menu Week", 52), ("Floor", 100), ("Block", 100)):
+        task = task_from_dataset_item(
+            0,
+            {
+                "prompt": f"Write {count} {seg_type}s, each at least 150 words.",
+                "type": seg_type,
+                "number": count,
+                "prefix": f"#*# {seg_type} 1:",
+                "checks_once": {},
+                "checks_range": {},
+                "checks_periodic": {},
+            },
+        )
+        assert resolve_official_parameter_profile(task) is None
+
+    # 32K Floor (200) still gets parameterized profile
+    task_32k_floor = task_from_dataset_item(
+        0,
+        {
+            "prompt": "Write 200 Floors, each at least 110 words.",
+            "type": "Floor",
+            "number": 200,
+            "prefix": "#*# Floor 1:",
+            "checks_once": {},
+            "checks_range": {},
+            "checks_periodic": {},
+        },
+    )
+    prof = resolve_official_parameter_profile(task_32k_floor)
+    assert prof is not None and prof.task_type == "Floor"
+
+    # Verify scripts/run_longgenbench_baselines.py supports --all, --workers, --continue-on-error
+    root = Path(__file__).resolve().parents[1]
+    spec = importlib.util.spec_from_file_location("run_lg_base", root / "scripts" / "run_longgenbench_baselines.py")
+    assert spec is not None and spec.loader is not None
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    args = mod.build_parser().parse_args(
+        [
+            "--dataset",
+            "dummy.json",
+            "--run-dir",
+            "runs/base",
+            "--all",
+            "--systems",
+            "agentwrite",
+            "cogwriter",
+            "--source-root",
+            "third_party/CogWriter",
+            "--workers",
+            "8",
+            "--continue-on-error",
+        ]
+    )
+    assert args.all is True and args.workers == 8 and args.continue_on_error is True
 
 
 def test_call_adapter_preserves_upstream_empty_string_failure_semantics() -> None:

@@ -71,11 +71,23 @@ def test_run_agentwrite_generates_sequential_checkpointed_segments(tmp_path) -> 
         planning_factory,
         writing_factory,
         checkpoint_dir=tmp_path,
+        temperature=0.7,
     )
 
     assert output["final_text"].startswith("#*# Week 1:\nAlpha body.")
     assert "#*# Week 2:\nBeta body." in output["final_text"]
+    assert output["metadata"]["temperature"] == 0.7
     assert "Alpha body." in writing_prompts[1]
     assert "*** finished ***" not in writing_prompts[1]
     assert (tmp_path / "plan.json").exists()
     assert (tmp_path / "segments" / "0002.json").exists()
+
+    bold_plan = "\n".join(
+        [
+            "1. **Segment 1** - **Main Point**: Alpha - **Word Count**: at least 100 words",
+            "2. **Segment 2** - **Main Point**: Beta - **Word Count**: approximately 120 words",
+        ]
+    )
+    parsed = parse_agentwrite_plan(bold_plan, 2)
+    assert [s.index for s in parsed] == [1, 2]
+    assert parsed[0].word_count == 100 and parsed[1].word_count == 120

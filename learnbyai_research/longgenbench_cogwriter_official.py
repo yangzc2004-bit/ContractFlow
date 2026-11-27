@@ -6,6 +6,7 @@ import copy
 import hashlib
 import importlib
 import sys
+import threading
 import time
 import types
 from dataclasses import dataclass
@@ -14,6 +15,8 @@ from typing import Any, Callable
 
 from .llm import ChatModel, completion_history
 from .longgenbench import LongGenTask, parse_document_blocks, task_record
+
+_OFFICIAL_COGWRITER_LOCK = threading.Lock()
 
 
 COGWRITER_SOURCE_REPOSITORY = ""
@@ -473,8 +476,26 @@ def official_parameter_profile(task: LongGenTask) -> OfficialCogWriterParameterP
     )
 
 
+def resolve_official_parameter_profile(
+    task: LongGenTask,
+) -> OfficialCogWriterParameterProfile | None:
+    """Return None for native 16K CogWriter types so upstream prompts stay 100% unchanged."""
+    if task.segment_type in {"Week", "Menu Week"} and task.segment_count == 52:
+        return None
+    if task.segment_type == "Floor" and task.segment_count == 100:
+        return None
+    if task.segment_type == "Block" and task.segment_count == 100:
+        return None
+    if task.segment_type in {"Week", "Menu Week"}:
+        # Non-52 Week/Menu Week tasks still run native upstream branch without AST rewrite
+        return None
+    return official_parameter_profile(task)
+
+
 def official_plan_key(task_type: str) -> str:
     keys = {
+        "Week": "weekly_plan",
+        "Menu Week": "weekly_plan",
         "Day": "weekly_plan",
         "Floor": "floor_plan",
         "Menu Day": "weekly_plan",
@@ -505,6 +526,7 @@ def run_official_cogwriter(
     max_refinements: int | None = None,
     parameter_profile: OfficialCogWriterParameterProfile | None = None,
     planning_validation_attempts: int = 1,
+    require_exact_plan_count: bool = False,
 ) -> dict[str, Any]:
     if planning_validation_attempts < 1:
         raise ValueError("planning_validation_attempts must be positive")
@@ -518,55 +540,68 @@ def run_official_cogwriter(
         temperature=temperature,
         history=history,
     )
-    cogwriter = load_official_cogwriter(
-        source_root,
-        adapter.complete,
-        max_refinements=max_refinements,
-        parameter_profile=parameter_profile,
-    )
     example = copy.deepcopy(dataset_item)
     if parameter_profile is not None:
         if parameter_profile.task_type != task.segment_type:
             raise ValueError("CogWriter parameter profile does not match the task type")
         example["type"] = parameter_profile.upstream_type
-    cogwriter_globals = cogwriter.async_generate.__globals__
-    planning_agent = cogwriter_globals["PlanningAgent"]
-    generation_agent = cogwriter_globals["GenerationAgent"]
 
-    async def generate() -> dict[str, Any]:
-        semaphore = asyncio.Semaphore(maximum_concurrent_requests)
-        retry_count = 0
-        while retry_count < 3:
-            try:
-                for _ in range(planning_validation_attempts):
-                    planned = await planning_agent.async_create_hierarchy(
-                        model_name,
-                        copy.deepcopy(example),
-                        semaphore,
-                    )
-                    entry_count = official_plan_entry_count(planned, task.segment_type)
-                    planning_entry_counts.append(entry_count)
-                    if entry_count == task.segment_count:
-                        return await generation_agent.async_generate(
+    with _OFFICIAL_COGWRITER_LOCK:
+        cogwriter = load_official_cogwriter(
+            source_root,
+            adapter.complete,
+            max_refinements=max_refinements,
+            parameter_profile=parameter_profile,
+        )
+        cogwriter_globals = cogwriter.async_generate.__globals__
+        planning_agent = cogwriter_globals["PlanningAgent"]
+        generation_agent = cogwriter_globals["GenerationAgent"]
+
+        async def generate() -> dict[str, Any]:
+            semaphore = asyncio.Semaphore(maximum_concurrent_requests)
+            retry_count = 0
+            while retry_count < 3:
+                try:
+                    best_planned: dict[str, Any] | None = None
+                    best_count = -1
+                    for _ in range(planning_validation_attempts):
+                        planned = await planning_agent.async_create_hierarchy(
                             model_name,
-                            planned,
+                            copy.deepcopy(example),
                             semaphore,
                         )
-                raise IncompleteOfficialPlanError(
-                    "official CogWriter planning produced "
-                    f"{planning_entry_counts[-1]}/{task.segment_count} entries "
-                    f"after {planning_validation_attempts} attempt(s)"
-                )
-            except IncompleteOfficialPlanError:
-                raise
-            except Exception:
-                retry_count += 1
-                if retry_count == 3:
+                        entry_count = official_plan_entry_count(planned, task.segment_type)
+                        planning_entry_counts.append(entry_count)
+                        if entry_count > best_count:
+                            best_count = entry_count
+                            best_planned = planned
+                        if entry_count == task.segment_count:
+                            return await generation_agent.async_generate(
+                                model_name,
+                                planned,
+                                semaphore,
+                            )
+                    if not require_exact_plan_count and best_planned is not None and best_count > 0:
+                        return await generation_agent.async_generate(
+                            model_name,
+                            best_planned,
+                            semaphore,
+                        )
+                    raise IncompleteOfficialPlanError(
+                        "official CogWriter planning produced "
+                        f"{planning_entry_counts[-1]}/{task.segment_count} entries "
+                        f"after {planning_validation_attempts} attempt(s)"
+                    )
+                except IncompleteOfficialPlanError:
                     raise
-                await asyncio.sleep(retry_count)
-        raise RuntimeError("official CogWriter exhausted retries")
+                except Exception:
+                    retry_count += 1
+                    if retry_count == 3:
+                        raise
+                    await asyncio.sleep(retry_count)
+            raise RuntimeError("official CogWriter exhausted retries")
 
-    processed = asyncio.run(generate())
+        processed = asyncio.run(generate())
     processed["type"] = task.segment_type
     final_text = str(processed["final_text"])
     blocks = parse_document_blocks(final_text, task.segment_type)

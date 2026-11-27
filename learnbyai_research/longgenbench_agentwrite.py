@@ -33,6 +33,7 @@ def run_agentwrite(
     planning_max_output_tokens: int = 16_384,
     segment_max_output_tokens: int = 4_096,
     max_plan_attempts: int = 3,
+    temperature: float = 1.0,
 ) -> dict[str, Any]:
     started = time.perf_counter()
     checkpoint_root = Path(checkpoint_dir)
@@ -54,6 +55,7 @@ def run_agentwrite(
             planning_client,
             max_output_tokens=planning_max_output_tokens,
             max_attempts=max_plan_attempts,
+            temperature=temperature,
         )
         planning_history = completion_history(planning_client)
         write_json(
@@ -85,7 +87,7 @@ def run_agentwrite(
                 previous_text=previous_text,
                 step=step,
             ),
-            temperature=1.0,
+            temperature=temperature,
             max_output_tokens=segment_max_output_tokens,
         ).strip()
         if not text:
@@ -127,6 +129,7 @@ def run_agentwrite(
         "metadata": {
             "elapsed_seconds": round(time.perf_counter() - started, 4),
             "model": model_name,
+            "temperature": temperature,
             "adapter_version": AGENTWRITE_ADAPTER_VERSION,
             "source_repository": AGENTWRITE_SOURCE_REPOSITORY,
             "source_commit": AGENTWRITE_SOURCE_COMMIT,
@@ -154,12 +157,13 @@ def request_agentwrite_plan(
     *,
     max_output_tokens: int,
     max_attempts: int,
+    temperature: float = 1.0,
 ) -> tuple[str, list[AgentWriteStep]]:
     last_error: Exception | None = None
     for _ in range(max_attempts):
         plan_text = client.complete(
             build_agentwrite_plan_prompt(task),
-            temperature=1.0,
+            temperature=temperature,
             max_output_tokens=max_output_tokens,
         ).strip()
         try:
@@ -171,9 +175,10 @@ def request_agentwrite_plan(
 
 def parse_agentwrite_plan(plan_text: str, expected_count: int) -> list[AgentWriteStep]:
     pattern = re.compile(
-        r"(?:^|\n)\s*(?:Paragraph|Segment)\s+(\d+)\s*-\s*"
-        r"Main Point:\s*(.*?)\s*-\s*Word Count:\s*(\d+)\s*words?\.?\s*"
-        r"(?=\n\s*(?:Paragraph|Segment)\s+\d+\s*-|\Z)",
+        r"(?:^|\n)\s*(?:[-*]\s*|\d+\.\s*)?\*{0,2}(?:Paragraph|Segment)\s+(\d+)\*{0,2}\s*[-–—:]\s*"
+        r"\*{0,2}Main Point\*{0,2}:\s*(.*?)\s*[-–—]\s*"
+        r"\*{0,2}Word Count\*{0,2}:\s*(?:approximately\s+|at\s+least\s+)?(\d+)\s*words?\.?\s*"
+        r"(?=\n\s*(?:[-*]\s*|\d+\.\s*)?\*{0,2}(?:Paragraph|Segment)\s+\d+\*{0,2}\s*[-–—:]|\Z)",
         flags=re.IGNORECASE | re.DOTALL,
     )
     steps = [
