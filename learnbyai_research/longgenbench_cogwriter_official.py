@@ -47,10 +47,25 @@ class OfficialCogWriterCallAdapter:
     segment_max_output_tokens: int
     temperature: float
     history: list[dict[str, Any]]
+    max_planning_calls: int | None = None
+    max_total_calls: int | None = None
+    planning_calls: int = 0
+    total_calls: int = 0
 
     async def complete(self, model: str, prompt: str) -> str:
-        client = self.client_factory()
         phase = classify_official_prompt(prompt)
+        if phase == "planning":
+            self.planning_calls += 1
+            if self.max_planning_calls is not None and self.planning_calls > self.max_planning_calls:
+                raise RuntimeError(
+                    f"official CogWriter exceeded planning call cap ({self.max_planning_calls})"
+                )
+        self.total_calls += 1
+        if self.max_total_calls is not None and self.total_calls > self.max_total_calls:
+            raise RuntimeError(
+                f"official CogWriter exceeded total call cap ({self.max_total_calls})"
+            )
+        client = self.client_factory()
         max_output_tokens = (
             self.planning_max_output_tokens
             if phase == "planning"
@@ -360,7 +375,10 @@ def official_parameter_profile(task: LongGenTask) -> OfficialCogWriterParameterP
             planning_function="async_create_week_plan",
             generation_function="async_generate_week",
             planning_string_replacements=(
-                ("weekly plan containing 52 weeks", "daily plan containing 365 days"),
+                (
+                    "weekly plan containing 52 weeks",
+                    f"daily plan containing {task.segment_count} days",
+                ),
                 ("exact week", "exact day"),
                 ("which weeks they will be in", "which days they will be in"),
                 ("weekly plan for each week", "daily plan for each day"),
@@ -397,7 +415,11 @@ def official_parameter_profile(task: LongGenTask) -> OfficialCogWriterParameterP
             planning_string_replacements=(
                 (
                     "weekly menu plan containing 52 weeks",
-                    "daily menu plan containing 365 days",
+                    f"daily menu plan containing {task.segment_count} days",
+                ),
+                (
+                    "weekly plan containing 52 weeks",
+                    f"daily menu plan containing {task.segment_count} days",
                 ),
                 ("exact week", "exact day"),
                 ("which weeks they will be in", "which days they will be in"),
@@ -533,12 +555,15 @@ def run_official_cogwriter(
     started = time.perf_counter()
     history: list[dict[str, Any]] = []
     planning_entry_counts: list[int] = []
+    ref_cap = 10 if max_refinements is None else max_refinements
     adapter = OfficialCogWriterCallAdapter(
         client_factory=client_factory,
         planning_max_output_tokens=planning_max_output_tokens,
         segment_max_output_tokens=segment_max_output_tokens,
         temperature=temperature,
         history=history,
+        max_planning_calls=max(24, planning_validation_attempts * 8),
+        max_total_calls=max(80, task.segment_count * (ref_cap + 4) + 32),
     )
     example = copy.deepcopy(dataset_item)
     if parameter_profile is not None:
