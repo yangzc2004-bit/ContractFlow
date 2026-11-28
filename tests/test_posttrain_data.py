@@ -389,6 +389,33 @@ def test_render_formatted_document_strips_duplicate_headings_and_separators() ->
     assert rendered_open.startswith("## 第一章：木星边缘的静默契约\n\n晨昏线号在木星轨道附近失联。")
     assert "## 第 2 章\n\n调查团队启程前往目标坐标。" in rendered_open
 
+    # markdown_open ZH with English fallback unit_label="Chapter" + plain Chinese heading line (like canary_012)
+    en_label_zh_contract = DocumentContract(
+        global_brief="数据跨境合规协议草案。",
+        global_invariants=[],
+        unit_label="Chapter",
+        total_units=2,
+        rules=[],
+        units=[
+            UnitContract(index=1, title="Chapter 1", min_words=50, max_words=100),
+            UnitContract(index=2, title="Chapter 2", min_words=50, max_words=100),
+        ],
+    )
+    rendered_zh_localized = render_formatted_document(
+        en_label_zh_contract,
+        {
+            1: "第一章 数据资产全景图：分级矩阵\n\n第一条【目的与定义】本章节确立治理基石。",
+            2: "第二章从跨境传输场景出发展开条款推演。\n\n具体流程如下。",
+        },
+        output_format_id="markdown_open",
+        language="zh",
+    )
+    assert "## Chapter 1" not in rendered_zh_localized
+    assert "## Chapter 2" not in rendered_zh_localized
+    assert rendered_zh_localized.startswith("## 第一章 数据资产全景图：分级矩阵\n\n第一条【目的与定义】本章节确立治理基石。")
+    # Line ending with "。" is narrative prose, not a title -> gets localized "## 第 2 章"
+    assert "## 第 2 章\n\n第二章从跨境传输场景出发展开条款推演。" in rendered_zh_localized
+
 
 def test_open_a1_calibrates_unit_word_budgets_to_target_length(tmp_path) -> None:
     class MockOpenA1LLM:
@@ -510,6 +537,38 @@ def test_evaluate_sample_quality_6_gates_language_and_hygiene() -> None:
     assert "stacked_markdown_headings" in q_dirty["format_hygiene_issues"]
     assert "duplicate_hr_separators" in q_dirty["format_hygiene_issues"]
     assert "leftover_unit_tags" in q_dirty["format_hygiene_issues"]
+
+    # 5) ZH prose with English-only compiled contract must FAIL Gate 5 contract language check
+    en_contract = {
+        "total_units": 2,
+        "units": [{"index": 1}, {"index": 2}],
+        "global_brief": "Episode breakdown for a serialized streaming drama.",
+        "global_invariants": [
+            "Each episode must be between 143 and 186 characters.",
+            "The outline must support narrative rhythm planning and suspense hooks.",
+        ],
+        "rules": [{"scope": "single", "index": 1, "obligation": "Design a cold open using flashback."}],
+    }
+    q_bad_contract = evaluate_sample_quality(
+        zh_record,
+        {**base_result, "contract": en_contract, "final_text": zh_clean},
+    )
+    assert q_bad_contract["passed"] is False
+    assert any(r.startswith("contract_language_mismatch_zh") for r in q_bad_contract["reasons"])
+
+    zh_contract = {
+        "total_units": 2,
+        "units": [{"index": 1}, {"index": 2}],
+        "global_brief": "面向分布式共识协议的中文系统设计指南。",
+        "global_invariants": ["每章保持严谨工程表述，统一使用中文专业术语与操作清单。"],
+        "rules": [{"scope": "single", "index": 1, "obligation": "给出状态机复制与日志压缩的核心流程。"}],
+    }
+    q_good_contract = evaluate_sample_quality(
+        zh_record,
+        {**base_result, "contract": zh_contract, "final_text": zh_clean},
+    )
+    assert q_good_contract["passed"] is True
+    assert q_good_contract["contract_cjk_ratio"] is not None and q_good_contract["contract_cjk_ratio"] >= 0.25
 
 
 def test_cjk_budget_scale_only_scales_zh_internal_drafting_budget(tmp_path) -> None:

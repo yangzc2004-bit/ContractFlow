@@ -1023,15 +1023,27 @@ def render_formatted_document(
     if output_format_id == "markdown_open":
         blocks: list[str] = []
         leading_atx_re = re.compile(r"^#{1,3}\s+([^\n]+?)\s*(?:\n+|$)")
+        leading_zh_plain_heading_re = re.compile(
+            r"^(第\s*[0-9一二三四五六七八九十百千万]+\s*[章节篇部条][^\n]{0,60})\s*\n+"
+        )
+        en_generic_label_re = re.compile(
+            r"^(?:Chapter|Section|Article|Part)\s*$",
+            flags=re.IGNORECASE,
+        )
         unit_marker_re = re.compile(
             r"^(?:第\s*[0-9一二三四五六七八九十百千万]+\s*\S+|(?:Chapter|Section|Article|Part)\s+\d+)",
             flags=re.IGNORECASE,
+        )
+        effective_label = (
+            "章"
+            if language == "zh" and en_generic_label_re.match(contract.unit_label.strip())
+            else contract.unit_label
         )
         for unit in contract.units:
             raw_text = unit_texts.get(unit.index, "").strip()
             if not raw_text:
                 continue
-            tag = _unit_tag_template(contract.unit_label, language, str(unit.index))
+            tag = _unit_tag_template(effective_label, language, str(unit.index))
             body = _sanitize_unit_body(
                 raw_text,
                 tag=tag,
@@ -1041,8 +1053,12 @@ def render_formatted_document(
             )
             if not body:
                 continue
-            generic_title = f"{contract.unit_label} {unit.index}"
-            heading = tag if unit.title.strip() in ("", generic_title) else unit.title.strip()
+            generic_titles = {
+                "",
+                f"{contract.unit_label} {unit.index}",
+                f"{effective_label} {unit.index}",
+            }
+            heading = tag if unit.title.strip() in generic_titles else unit.title.strip()
             m_atx = leading_atx_re.match(body)
             if m_atx:
                 sub = m_atx.group(1).strip()
@@ -1051,9 +1067,17 @@ def render_formatted_document(
                     body = rest
                     if unit_marker_re.match(sub):
                         heading = sub
-                    elif unit.title.strip() in ("", generic_title):
+                    elif unit.title.strip() in generic_titles:
                         sep = "：" if language == "zh" else ": "
                         heading = f"{tag}{sep}{sub}"
+            elif language == "zh":
+                m_plain = leading_zh_plain_heading_re.match(body)
+                if m_plain:
+                    sub = m_plain.group(1).strip()
+                    rest = body[m_plain.end():].strip()
+                    if rest and not re.search(r"[。！？.!?]$", sub):
+                        body = rest
+                        heading = sub
             blocks.append(f"## {heading}\n\n{body}")
         return "\n\n".join(blocks)
 
@@ -1234,6 +1258,22 @@ def evaluate_sample_quality(
     cjk_chars = len(re.findall(r"[\u4e00-\u9fff]", final_text))
     cjk_ratio = round(cjk_chars / max(1, actual_len), 4)
 
+    contract_parts: list[str] = []
+    if contract.get("global_brief"):
+        contract_parts.append(str(contract["global_brief"]))
+    for inv in contract.get("global_invariants", []) or []:
+        contract_parts.append(str(inv))
+    for rule in contract.get("rules", []) or []:
+        if isinstance(rule, dict) and rule.get("obligation"):
+            contract_parts.append(str(rule["obligation"]))
+    contract_text = "\n".join(contract_parts).strip()
+    contract_len = word_count(contract_text)
+    contract_cjk_ratio: float | None = (
+        round(len(re.findall(r"[\u4e00-\u9fff]", contract_text)) / max(1, contract_len), 4)
+        if contract_len >= 20
+        else None
+    )
+
     meta = result.get("metadata", {})
     reviews = list(meta.get("review_results", []))
     repairs = {int(r["index"]): bool(r.get("accepted")) for r in meta.get("repair_records", []) if "index" in r}
@@ -1263,6 +1303,11 @@ def evaluate_sample_quality(
         reasons.append(f"language_mismatch_zh:cjk_ratio={cjk_ratio:.3f}")
     if language == "en" and cjk_ratio > max_en_cjk_ratio:
         reasons.append(f"language_mismatch_en:cjk_ratio={cjk_ratio:.3f}")
+    if contract_cjk_ratio is not None:
+        if language == "zh" and contract_cjk_ratio < 0.25:
+            reasons.append(f"contract_language_mismatch_zh:cjk_ratio={contract_cjk_ratio:.3f}")
+        if language == "en" and contract_cjk_ratio > 0.10:
+            reasons.append(f"contract_language_mismatch_en:cjk_ratio={contract_cjk_ratio:.3f}")
     reasons.extend(hygiene_issues)
 
     return {
@@ -1273,6 +1318,7 @@ def evaluate_sample_quality(
         "target_length": target_len,
         "length_ratio": length_ratio,
         "cjk_ratio": cjk_ratio,
+        "contract_cjk_ratio": contract_cjk_ratio,
         "review_count": len(reviews),
         "review_pass_rate": review_pass_rate,
         "repetition_score": rep_score,
