@@ -50,7 +50,7 @@ def write_json_atomic(path: Path, value: Any) -> None:
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Self-bootstrap long-form SFT data via ContractFlow v2, run 4-gate quality filtering, and export dual SFT JSONLs."
+        description="Self-bootstrap long-form SFT data via ContractFlow v2, run 6-gate quality filtering, and export dual SFT JSONLs."
     )
     parser.add_argument("--prompts-jsonl", required=True, help="Path to prompts.jsonl from generate_posttrain_prompts.py.")
     parser.add_argument("--out-dir", required=True, help="Output directory for generations, checkpoints, SFT exports, and review report.")
@@ -63,8 +63,20 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--repair-max-output-tokens", type=positive_int, default=4096)
     parser.add_argument("--max-singleton-retries", type=positive_int, default=2)
     parser.add_argument("--length-retry-ratio", type=float, default=0.7)
+    parser.add_argument(
+        "--draft-temperature",
+        type=float,
+        default=0.65,
+        help="Sampling temperature for prose drafting during SFT synthesis (default: 0.65; compile/review stay deterministic).",
+    )
+    parser.add_argument(
+        "--cjk-budget-scale",
+        type=float,
+        default=1.0,
+        help="Optional internal drafting budget scale for CJK prompts (default: 1.0; e.g., 0.70 to compensate CJK char/token ratio).",
+    )
     parser.add_argument("--limit", type=positive_int, default=None, help="Optional cap on number of prompts to process.")
-    parser.add_argument("--export-all", action="store_true", help="Export even samples that failed the 4-gate quality filter (for debugging).")
+    parser.add_argument("--export-all", action="store_true", help="Export even samples that failed the 6-gate quality filter (for debugging).")
     parser.add_argument("--continue-on-error", action="store_true")
     parser.add_argument("--env-file", default=str(ROOT / ".env"))
     return parser
@@ -95,6 +107,7 @@ def run(args: argparse.Namespace) -> None:
         repair_max_output_tokens=args.repair_max_output_tokens,
         max_singleton_retries=args.max_singleton_retries,
         length_retry_ratio=args.length_retry_ratio,
+        draft_temperature=args.draft_temperature,
         use_contracts=True,
         use_review_repair=True,
     )
@@ -111,6 +124,7 @@ def run(args: argparse.Namespace) -> None:
                 client,
                 config=cfg,
                 checkpoint_path=ckpt_dir / f"{sid}.json",
+                cjk_budget_scale=args.cjk_budget_scale,
             )
             write_json_atomic(out_path, sample)
             return "pass" if sample["quality"]["passed"] else "filtered"

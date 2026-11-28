@@ -303,6 +303,21 @@ def test_posttrain_cli_scripts_parse_arguments() -> None:
         ["--prompts-jsonl", "runs/canary/prompts.jsonl", "--out-dir", "runs/canary_sft", "--workers", "4"]
     )
     assert s_args.workers == 4 and s_args.length_retry_ratio == 0.7
+    assert s_args.draft_temperature == 0.65 and s_args.cjk_budget_scale == 1.0
+
+    s_custom = syn_mod.build_parser().parse_args(
+        [
+            "--prompts-jsonl",
+            "runs/canary/prompts.jsonl",
+            "--out-dir",
+            "runs/canary_sft",
+            "--draft-temperature",
+            "0.5",
+            "--cjk-budget-scale",
+            "0.7",
+        ]
+    )
+    assert s_custom.draft_temperature == 0.5 and s_custom.cjk_budget_scale == 0.7
 
 
 def test_render_formatted_document_strips_duplicate_headings_and_separators() -> None:
@@ -495,4 +510,105 @@ def test_evaluate_sample_quality_6_gates_language_and_hygiene() -> None:
     assert "stacked_markdown_headings" in q_dirty["format_hygiene_issues"]
     assert "duplicate_hr_separators" in q_dirty["format_hygiene_issues"]
     assert "leftover_unit_tags" in q_dirty["format_hygiene_issues"]
+
+
+def test_cjk_budget_scale_only_scales_zh_internal_drafting_budget(tmp_path) -> None:
+    class MockBudgetLLM:
+        model = "qwen3.5-9b-mock"
+
+        def complete(self, prompt: str, **kwargs) -> str:
+            if "CONTRACTFLOW_SPARSE_CONTRACT_JSON" in prompt:
+                return json.dumps(
+                    {
+                        "global_brief": "测试文档大纲。",
+                        "total_units": 4,
+                        "unit_label": "章",
+                        "unit_titles": {str(i): f"第 {i} 章" for i in range(1, 5)},
+                        "global_invariants": [],
+                        "rules": [],
+                    }
+                )
+            if "CONTRACTFLOW_DRAFT_UNITS" in prompt:
+                match = re.search(r"Write ONLY the requested units: (\[[^\]]+\])", prompt)
+                indices = json.loads(match.group(1))
+                return "\n".join(
+                    f"<<<UNIT {idx}>>>\n" + ("中" * 500) + f"\n<<<END UNIT {idx}>>>"
+                    for idx in indices
+                )
+            if "CONTRACTFLOW_DRAFT_SINGLE_UNIT" in prompt:
+                return "中" * 500
+            return "{}"
+
+        def completion_metadata(self) -> dict:
+            return {"finish_reason": "stop"}
+
+        def completion_history(self) -> list[dict]:
+            return []
+
+    zh_open_record = {
+        "spec_id": "test_zh_scale_open",
+        "prompt": "请撰写一篇约 4000 字的中文技术分析报告。",
+        "spec": {
+            "spec_id": "test_zh_scale_open",
+            "bucket": "open_a1",
+            "domain_id": "A1_tech_handbook",
+            "language": "zh",
+            "length_tier": "4K",
+            "target_length": 4000,
+            "unit_count": 4,
+            "unit_label": "章",
+            "min_unit_words": 800,
+            "max_unit_words": 1200,
+            "output_format_id": "markdown_open",
+        },
+        "seed_item": {"title": "中文技术报告"},
+    }
+    zh_sample = synthesize_posttrain_sample(
+        zh_open_record,
+        MockBudgetLLM(),
+        config=FlowConfig(batch_size=4, use_contracts=True, use_review_repair=False),
+        checkpoint_path=tmp_path / "zh_scale_ckpt.json",
+        cjk_budget_scale=0.7,
+    )
+    # 4000 * 0.7 / 4 = 700 -> cal_min = round(700*0.88)=616, cal_max = round(700*1.15)=805
+    assert zh_sample["contract_v2"]["units"][0]["min_words"] == 616
+    assert zh_sample["contract_v2"]["units"][0]["max_words"] == 805
+    # Original target_length in spec & quality evaluation must remain unscaled (4000)
+    assert zh_sample["spec"]["target_length"] == 4000
+    assert zh_sample["quality"]["target_length"] == 4000
+
+    en_record = {
+        "spec_id": "test_en_unscaled",
+        "prompt": "Write a 4000-word technical report.",
+        "spec": {
+            "spec_id": "test_en_unscaled",
+            "bucket": "structured_b",
+            "domain_id": "B1_codebase_design",
+            "language": "en",
+            "length_tier": "4K",
+            "target_length": 4000,
+            "unit_count": 4,
+            "unit_label": "Section",
+            "min_unit_words": 800,
+            "max_unit_words": 1200,
+            "output_format_id": "markdown_h2",
+        },
+        "seed_item": {"title": "English Tech Report"},
+    }
+    en_sample = synthesize_posttrain_sample(
+        en_record,
+        MockBudgetLLM(),
+        config=FlowConfig(batch_size=4, use_contracts=True, use_review_repair=False),
+        checkpoint_path=tmp_path / "en_scale_ckpt.json",
+        cjk_budget_scale=0.7,
+    )
+    assert en_sample["contract_v2"]["units"][0]["min_words"] == 800
+    assert en_sample["contract_v2"]["units"][0]["max_words"] == 1200
+
+    try:
+        synthesize_posttrain_sample(zh_open_record, MockBudgetLLM(), cjk_budget_scale=0.0)
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("Non-positive cjk_budget_scale should raise ValueError")
 

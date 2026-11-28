@@ -1098,8 +1098,11 @@ def synthesize_posttrain_sample(
     *,
     config: FlowConfig | None = None,
     checkpoint_path: str | Path | None = None,
+    cjk_budget_scale: float = 1.0,
 ) -> dict[str, Any]:
     """Run pure task-agnostic ContractFlow v2 on a synthetic training prompt."""
+    if cjk_budget_scale <= 0.0:
+        raise ValueError("cjk_budget_scale must be positive")
     spec = prompt_record["spec"]
     prompt = str(prompt_record["prompt"])
     bucket: BucketKind = spec["bucket"]
@@ -1109,8 +1112,9 @@ def synthesize_posttrain_sample(
 
     total_units = None if bucket == "open_a1" else int(spec["unit_count"])
     unit_label = None if bucket == "open_a1" else str(spec["unit_label"])
-    min_words = int(spec["min_unit_words"])
-    max_words = int(spec["max_unit_words"])
+    budget_scale = cjk_budget_scale if language == "zh" else 1.0
+    min_words = max(1, int(round(int(spec["min_unit_words"]) * budget_scale)))
+    max_words = max(min_words + 10, int(round(int(spec["max_unit_words"]) * budget_scale)))
 
     precompiled_contract: DocumentContract | None = None
     ckpt_exists = checkpoint_path is not None and Path(checkpoint_path).exists()
@@ -1126,7 +1130,7 @@ def synthesize_posttrain_sample(
             max_output_tokens=cfg.plan_max_output_tokens,
             retry_cap_tokens=cfg.plan_retry_cap_tokens,
         )
-        target_length = max(1, int(spec.get("target_length", 1)))
+        target_length = max(1, int(round(int(spec.get("target_length", 1)) * budget_scale)))
         actual_units = max(1, len(compiled.units))
         lower_floor = min(max(1, min_words), 120)
         calibrated_avg = max(lower_floor, min(2_600, int(round(target_length / actual_units))))

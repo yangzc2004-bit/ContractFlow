@@ -697,6 +697,7 @@ def test_multilingual_word_count_and_language_agnostic_prompts() -> None:
     assert word_count("España y acción: naïve café") == 5
 
     compile_prompt = build_sparse_contract_prompt("请撰写一份分布式存储设计文档。")
+    assert '"unit_label"' in compile_prompt
     assert "strictly in the same language as USER_REQUEST" in compile_prompt
     assert "Preserve every proper noun" in compile_prompt
     assert "outer section-heading or delimiter formatting syntax" in compile_prompt
@@ -715,14 +716,16 @@ def test_multilingual_word_count_and_language_agnostic_prompts() -> None:
     )
     window_prompt = build_window_draft_prompt(contract, contract.units, rolling_state="")
     assert "strictly in the same language as GLOBAL_BRIEF" in window_prompt
-    assert "characters for non-space-delimited scripts" in window_prompt
+    assert "individual characters, not words or tokens, for non-space-delimited scripts" in window_prompt
+    assert "Treat GLOBAL_INVARIANTS as silent background guidelines" in window_prompt
     assert "do NOT exceed 800" in window_prompt
     assert "boilerplate" in window_prompt
     assert "horizontal rules" in window_prompt
 
     single_prompt = build_singleton_draft_prompt(contract, contract.units[0], rolling_state="")
     assert "strictly in the same language as GLOBAL_BRIEF" in single_prompt
-    assert "characters for non-space-delimited scripts" in single_prompt
+    assert "individual characters, not words or tokens, for non-space-delimited scripts" in single_prompt
+    assert "Treat GLOBAL_INVARIANTS as silent background guidelines" in single_prompt
     assert "do NOT exceed 800" in single_prompt
     assert "horizontal rules" in single_prompt
 
@@ -746,4 +749,75 @@ def test_multilingual_word_count_and_language_agnostic_prompts() -> None:
     assert "characters for non-space-delimited scripts" in repair_raw
 
 
+def test_draft_temperature_config_and_routing() -> None:
+    assert FlowConfig().draft_temperature == 0.2
+    try:
+        FlowConfig(draft_temperature=-0.1)
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("Negative draft_temperature should raise ValueError")
 
+    observed: list[tuple[str, float]] = []
+
+    class TempRecorderLLM:
+        model = "temp-recorder"
+
+        def complete(self, prompt: str, **kwargs) -> str:
+            temp = float(kwargs.get("temperature", -1.0))
+            if "CONTRACTFLOW_SPARSE_CONTRACT_JSON" in prompt:
+                observed.append(("compile", temp))
+                return json.dumps(
+                    {
+                        "global_brief": "Two-section technical note.",
+                        "total_units": 2,
+                        "unit_label": "Section",
+                        "unit_titles": {"1": "Section 1", "2": "Section 2"},
+                        "global_invariants": ["Keep terminology consistent."],
+                        "rules": [{"scope": "single", "index": 1, "obligation": "Mention quorum."}],
+                    }
+                )
+            if "CONTRACTFLOW_DRAFT_UNITS" in prompt:
+                observed.append(("draft_window", temp))
+                # Deliberately make unit 2 short so singleton retry also runs
+                return (
+                    "<<<UNIT 1>>>\n"
+                    + " ".join(f"w{k}" for k in range(40))
+                    + " quorum.\n<<<END UNIT 1>>>\n"
+                    "<<<UNIT 2>>>\ntoo short\n<<<END UNIT 2>>>"
+                )
+            if "CONTRACTFLOW_DRAFT_SINGLE_UNIT" in prompt:
+                observed.append(("draft_singleton", temp))
+                return " ".join(f"s{k}" for k in range(45))
+            if "CONTRACTFLOW_REVIEW_UNITS_JSON" in prompt:
+                observed.append(("review", temp))
+                if not any(stage == "repair" for stage, _ in observed):
+                    return json.dumps({"results": [{"index": 1, "passed": False, "issues": ["Clarify quorum."]}]})
+                return json.dumps({"results": [{"index": 1, "passed": True, "issues": []}]})
+            if "CONTRACTFLOW_REPAIR_SINGLE_UNIT" in prompt or "CONTRACTFLOW_REPAIR_UNITS" in prompt:
+                observed.append(("repair", temp))
+                return " ".join(f"r{k}" for k in range(42)) + " explicit quorum."
+            return "{}"
+
+        def completion_metadata(self) -> dict:
+            return {"finish_reason": "stop"}
+
+        def completion_history(self) -> list[dict]:
+            return []
+
+    result = run_contractflow(
+        "Write a two-section note.",
+        TempRecorderLLM(),
+        config=FlowConfig(batch_size=2, draft_temperature=0.65, use_contracts=True, use_review_repair=True),
+        total_units=2,
+        unit_label="Section",
+        min_words=30,
+        max_words=60,
+    )
+    assert len(result["units"]) == 2 and all(u["text"] for u in result["units"])
+    temps = dict(observed)
+    assert temps["compile"] == 0.0
+    assert temps["draft_window"] == 0.65
+    assert temps["draft_singleton"] == 0.65
+    assert temps["review"] == 0.0
+    assert temps["repair"] == 0.1

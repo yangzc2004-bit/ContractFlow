@@ -95,6 +95,7 @@ class FlowConfig:
     repair_max_output_tokens: int = 4_096
     max_singleton_retries: int = 2
     length_retry_ratio: float = 0.7
+    draft_temperature: float = 0.2
     rolling_state_chars: int = 800
     use_contracts: bool = True
     use_review_repair: bool = True
@@ -102,6 +103,8 @@ class FlowConfig:
     def __post_init__(self) -> None:
         if not 0.0 <= self.length_retry_ratio <= 1.0:
             raise ValueError("length_retry_ratio must be between 0.0 and 1.0")
+        if self.draft_temperature < 0.0:
+            raise ValueError("draft_temperature must be non-negative")
 
 
 # ---------------------------------------------------------------------------
@@ -241,7 +244,7 @@ Rules for accuracy:
 - Double-check that every integer field ("index", "start", "end", "step") matches the exact numbers in your "derivation" and "obligation".
 - If a rule spans positions separated by a constant stride (e.g., jumping by a fixed offset along a schedule or 2D grid), use scope "every" with exact "start", "end", and "step".
 - Keep each "obligation" concrete, faithful to USER_REQUEST, and free of invented details.
-- Write "global_brief", "unit_titles", "global_invariants", and every "obligation" strictly in the same language as USER_REQUEST.
+- Write "global_brief", "unit_label", "unit_titles", "global_invariants", and every "obligation" strictly in the same language as USER_REQUEST.
 - Preserve every proper noun, entity/project/organization/character name, and core premise from USER_REQUEST verbatim in "global_brief" (never drop or translate named entities).
 - When "total_units" is not explicitly fixed in USER_REQUEST, choose a natural number of chapters/sections proportional to the requested document length (roughly 500-1,200 words or CJK characters per unit).
 - Leave "unit_titles" empty ({{}}) unless specific chapter/section titles are requested or helpful for open-ended writing.
@@ -471,8 +474,9 @@ ROLLING_STATE (recent context for continuity):
 REQUIREMENTS:
 - Output every requested index exactly once.
 - Write all prose strictly in the same language as GLOBAL_BRIEF.
-- Each unit must stay strictly within {min_w} to {max_w} words (or characters for non-space-delimited scripts such as CJK) of final reader-facing prose; do NOT exceed {max_w}.
+- Each unit must stay strictly within {min_w} to {max_w} words (or individual characters, not words or tokens, for non-space-delimited scripts such as CJK) of final reader-facing prose; do NOT exceed {max_w}.
 - Fulfill every listed obligation naturally in its assigned unit.
+- Treat GLOBAL_INVARIANTS as silent background guidelines; NEVER quote, echo, or recite invariant wording (such as disclaimers or rule statements) verbatim in the prose.
 - Vary phrasing, structure, and concrete details across units; do not copy boilerplate sentences verbatim from previous units.
 - Do not include wrapper markdown headings, horizontal rules (`---` / `===`), or benchmark markers inside the prose.
 - Wrap each unit in exact tags, replacing {example_idx} with each requested index:
@@ -523,7 +527,8 @@ UNIT_OBLIGATIONS (must be clearly included):
 {note_section}
 REQUIREMENTS:
 - Write strictly in the same language as GLOBAL_BRIEF.
-- Stay strictly within {unit.min_words} to {unit.max_words} words (or characters for non-space-delimited scripts such as CJK) of final reader-facing prose; do NOT exceed {unit.max_words}.
+- Stay strictly within {unit.min_words} to {unit.max_words} words (or individual characters, not words or tokens, for non-space-delimited scripts such as CJK) of final reader-facing prose; do NOT exceed {unit.max_words}.
+- Treat GLOBAL_INVARIANTS as silent background guidelines; NEVER quote, echo, or recite invariant wording (such as disclaimers or rule statements) verbatim in the prose.
 - Vary phrasing and concrete details; do not copy boilerplate sentences verbatim from previous units.
 - Return ONLY the prose for unit {unit.index}. Do NOT add wrapper tags, headings, horizontal rules, or commentary.
 """
@@ -1065,7 +1070,7 @@ def _draft_window(
             raw = llm.complete(
                 prompt,
                 system="Return only clean final prose for the requested unit.",
-                temperature=0.2,
+                temperature=cfg.draft_temperature,
                 max_output_tokens=budget,
             )
             text = parse_singleton_unit(raw, unit, unit_label=contract.unit_label)
@@ -1080,7 +1085,7 @@ def _draft_window(
             raw = llm.complete(
                 prompt,
                 system="Write only the requested units using the required tags.",
-                temperature=0.2,
+                temperature=cfg.draft_temperature,
                 max_output_tokens=budget,
             )
             parsed = parse_unit_batch(batch, raw, unit_label=contract.unit_label)
